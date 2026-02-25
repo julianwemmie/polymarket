@@ -1,0 +1,26 @@
+# Data files (large, regenerated from pipeline)
+markets.csv
+missing_markets.csv
+goldsky/
+processed/
+
+# Python
+__pycache__/
+*.py[codz]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Environment
+.env
