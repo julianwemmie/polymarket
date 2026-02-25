@@ -1,0 +1,11 @@
+[project]
+name = "parallel-goldsky-scraper"
+version = "0.1.0"
+description = "Parallel scraper for Goldsky orderFilledEvents subgraph"
+requires-python = ">=3.10"
+dependencies = [
+    "aiohttp>=3.9",
+]
+
+[tool.uv]
+dev-dependencies = []
