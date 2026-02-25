@@ -52,26 +52,12 @@ Rate limits are enforced via Cloudflare throttling (requests delayed/queued, not
 
 See [2026-02-25-historical-data-methods.md](./2026-02-25-historical-data-methods.md) for the two methods of getting complete historical data (Goldsky subgraph scraping and Polygon blockchain scanning).
 
-## Detection Signals (fleshed out)
+## Detection Signals
 
-### Signal 2: Timing Relative to Information Release
+See [detection-techniques.md](./2026-02-25-detection-techniques.md) for full details.
 
-**Approach A (self-contained, no external news API):** Use price spikes as a proxy for information release. A jump from 20% to 80% in 30 minutes = information entered the market.
-
-- Detect spikes from CLOB price history or from the trade data itself
-- Look backward: which wallets entered positions 30min–4hrs before the spike
-- Track which wallets repeatedly appear in pre-spike windows across markets
-- For ongoing monitoring: WebSocket (`wss://ws-live-data.polymarket.com`) streams prices in real-time across all markets — watch for spikes and trigger investigation immediately
-
-**Approach B (richer signal, more complexity):** Correlate with actual news timestamps from GDELT, NewsAPI, or Twitter/X. Requires NLP/LLM layer to match markets to news events. Layer on later.
-
-### Signal 3: Statistical Implausibility
-
-With complete per-wallet trade history, compute:
-- **Win rate on low-probability bets:** Buying YES at <20% that resolves YES. Even great forecasters hit ~30-40%. Hitting 80%+ across 10+ such bets is astronomically unlikely.
-- **Brier score vs market consensus:** Wallet positions consistently outperform market implied probabilities by a wide margin → p-value against null model.
-- **Kelly criterion violation:** Insiders put 50%+ of capital into single niche bets and win. Skilled traders diversify.
-- **Concentration in niche markets:** High accuracy on obscure markets where no one should have high confidence.
+- **Signal 1: Statistical Implausibility** — Suite of per-wallet metrics (contrarian win rate, niche accuracy, profit factor, Brier score, position concentration, bet size vs odds, etc.). Each metric stands alone; optionally combine into weighted aggregate later.
+- **Signal 2: Timing** — Wallets that repeatedly appear in pre-spike windows (30min–4hrs before price moves). Independent of accuracy.
 
 ## Key APIs Reference
 
