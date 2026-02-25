@@ -1,20 +1,145 @@
 import { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { api } from "../api/client";
-import type { MarketDetail } from "../types";
-import SuspicionBadge from "../components/SuspicionBadge";
-import TradeTimeline from "../components/TradeTimeline";
-import VolumeChart from "../components/VolumeChart";
+import type { MarketDetail, Trade } from "../types";
+
+function formatVolume(volume: number): string {
+  if (volume >= 1_000_000) return `$${(volume / 1_000_000).toFixed(1)}M`;
+  if (volume >= 1_000) return `$${(volume / 1_000).toFixed(1)}k`;
+  return `$${volume.toFixed(0)}`;
+}
 
 function truncateAddress(addr: string): string {
   if (addr.length <= 10) return addr;
   return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
 }
 
-function formatVolume(volume: number): string {
-  if (volume >= 1_000_000) return `$${(volume / 1_000_000).toFixed(1)}M`;
-  if (volume >= 1_000) return `$${(volume / 1_000).toFixed(1)}k`;
-  return `$${volume.toFixed(0)}`;
+interface WalletSummary {
+  address: string;
+  trades: Trade[];
+  net_profit: number;
+  total_volume: number;
+  buy_count: number;
+  sell_count: number;
+  is_suspicious: boolean;
+}
+
+function groupByWallet(trades: Trade[]): WalletSummary[] {
+  const map = new Map<string, Trade[]>();
+  for (const t of trades) {
+    const existing = map.get(t.wallet_address) || [];
+    existing.push(t);
+    map.set(t.wallet_address, existing);
+  }
+
+  const wallets: WalletSummary[] = [];
+  for (const [address, walletTrades] of map.entries()) {
+    wallets.push({
+      address,
+      trades: walletTrades.sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      ),
+      net_profit: walletTrades.reduce((sum, t) => sum + (t.profit || 0), 0),
+      total_volume: walletTrades.reduce((sum, t) => sum + t.amount, 0),
+      buy_count: walletTrades.filter((t) => t.side === "BUY").length,
+      sell_count: walletTrades.filter((t) => t.side === "SELL").length,
+      is_suspicious: walletTrades.some((t) => t.is_suspicious),
+    });
+  }
+
+  // Flagged first, then by profit
+  wallets.sort((a, b) => {
+    if (a.is_suspicious && !b.is_suspicious) return -1;
+    if (!a.is_suspicious && b.is_suspicious) return 1;
+    return b.net_profit - a.net_profit;
+  });
+
+  return wallets;
+}
+
+function WalletRow({ wallet }: { wallet: WalletSummary }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <>
+      <tr
+        onClick={() => setOpen(!open)}
+        className={`border-b border-gray-800/50 cursor-pointer transition-colors ${
+          wallet.is_suspicious
+            ? "bg-red-950/10 hover:bg-red-950/20"
+            : "hover:bg-gray-800/30"
+        }`}
+      >
+        <td className="px-4 py-3">
+          <div className="flex items-center gap-2">
+            <Link
+              to={`/wallets/${wallet.address}`}
+              onClick={(e) => e.stopPropagation()}
+              className="text-blue-400 hover:text-blue-300 font-mono text-xs transition-colors"
+            >
+              {truncateAddress(wallet.address)}
+            </Link>
+            {wallet.is_suspicious && (
+              <span className="text-xs font-semibold px-1.5 py-0 rounded-full bg-red-500/20 text-red-400 border border-red-500/30">
+                Flagged
+              </span>
+            )}
+          </div>
+        </td>
+        <td className="px-4 py-3 text-right text-gray-400 font-mono text-xs">
+          {wallet.trades.length}
+        </td>
+        <td className="px-4 py-3 text-right text-gray-300 font-mono text-xs">
+          {formatVolume(wallet.total_volume)}
+        </td>
+        <td className="px-4 py-3 text-right font-mono text-xs">
+          <span className={wallet.net_profit >= 0 ? "text-green-400" : "text-red-400"}>
+            {wallet.net_profit >= 0 ? "+" : ""}
+            {formatVolume(wallet.net_profit)}
+          </span>
+        </td>
+        <td className="px-4 py-3 text-right">
+          <svg
+            className={`w-4 h-4 text-gray-500 transition-transform inline ${open ? "rotate-180" : ""}`}
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+          >
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+          </svg>
+        </td>
+      </tr>
+      {open && wallet.trades.map((t) => (
+        <tr key={t.id} className="border-b border-gray-800/20 bg-gray-950/30">
+          <td className="pl-8 pr-4 py-1.5 text-gray-600 text-xs whitespace-nowrap">
+            {new Date(t.timestamp).toLocaleString("en-US", {
+              month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+            })}
+          </td>
+          <td className="px-4 py-1.5 text-xs">
+            <span className={t.side === "BUY" ? "text-green-400" : "text-red-400"}>
+              {t.side}
+            </span>
+            {" "}
+            <span className="text-gray-500">{t.outcome}</span>
+          </td>
+          <td className="px-4 py-1.5 text-right text-gray-400 font-mono text-xs">
+            {formatVolume(t.amount)} @ {(t.price * 100).toFixed(1)}c
+          </td>
+          <td className="px-4 py-1.5 text-right font-mono text-xs">
+            {t.profit !== null ? (
+              <span className={t.profit >= 0 ? "text-green-400" : "text-red-400"}>
+                {t.profit >= 0 ? "+" : ""}{formatVolume(t.profit)}
+              </span>
+            ) : (
+              <span className="text-gray-700">--</span>
+            )}
+          </td>
+          <td />
+        </tr>
+      ))}
+    </>
+  );
 }
 
 export default function MarketPage() {
@@ -38,7 +163,7 @@ export default function MarketPage() {
       <div className="flex items-center justify-center py-32">
         <div className="flex flex-col items-center gap-3">
           <div className="w-8 h-8 border-2 border-red-500 border-t-transparent rounded-full animate-spin" />
-          <p className="text-gray-500 text-sm">Loading market data...</p>
+          <p className="text-gray-500 text-sm">Loading market...</p>
         </div>
       </div>
     );
@@ -49,50 +174,34 @@ export default function MarketPage() {
       <div className="flex items-center justify-center py-32">
         <div className="bg-red-900/20 border border-red-800 rounded-lg p-6 max-w-md text-center">
           <p className="text-red-400 font-medium">Failed to load market</p>
-          <p className="text-gray-500 text-sm mt-1">
-            {error || "Market not found"}
-          </p>
-          <Link
-            to="/"
-            className="inline-block mt-4 text-sm text-gray-400 hover:text-white transition-colors"
-          >
-            Back to leaderboard
+          <p className="text-gray-500 text-sm mt-1">{error || "Market not found"}</p>
+          <Link to="/markets" className="inline-block mt-4 text-sm text-gray-400 hover:text-white transition-colors">
+            Back to markets
           </Link>
         </div>
       </div>
     );
   }
 
-  const sortedTrades = [...market.trades].sort(
-    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-  );
+  const walletSummaries = groupByWallet(market.trades);
+  const flaggedCount = walletSummaries.filter((w) => w.is_suspicious).length;
 
   return (
     <div>
       {/* Breadcrumb */}
       <div className="flex items-center gap-2 text-sm text-gray-500 mb-4">
-        <Link to="/" className="hover:text-gray-300 transition-colors">
-          Leaderboard
-        </Link>
+        <Link to="/markets" className="hover:text-gray-300 transition-colors">Markets</Link>
         <span>/</span>
-        <span className="text-gray-400">Market</span>
+        <span className="text-gray-400 truncate max-w-xs">{market.question.slice(0, 40)}...</span>
       </div>
 
       {/* Market Header */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg p-6 mb-6">
-        <div className="flex items-start justify-between gap-4 mb-4">
-          <h1 className="text-xl font-bold text-white leading-snug flex-1">
-            {market.question}
-          </h1>
-          <SuspicionBadge score={market.suspicion_score} size="lg" />
-        </div>
+        <h1 className="text-xl font-bold text-white leading-snug mb-3">
+          {market.question}
+        </h1>
 
         <div className="flex flex-wrap items-center gap-3">
-          <span className="text-xs bg-gray-800 text-gray-300 px-2.5 py-1 rounded border border-gray-700">
-            {market.entity}
-          </span>
-          <span className="text-xs text-gray-500">{market.category}</span>
-          <span className="text-gray-700">|</span>
           <span
             className={`text-xs font-bold px-2 py-0.5 rounded ${
               market.resolution === "Yes"
@@ -104,146 +213,45 @@ export default function MarketPage() {
           >
             Resolved: {market.resolution || "Pending"}
           </span>
-          <span className="text-gray-700">|</span>
           <span className="text-xs text-gray-400">
-            Volume:{" "}
-            <span className="text-white font-medium">
-              {formatVolume(market.volume)}
-            </span>
+            Volume: <span className="text-white font-medium">{formatVolume(market.volume)}</span>
           </span>
-          <span className="text-gray-700">|</span>
           <span className="text-xs text-gray-400">
-            Flagged wallets:{" "}
-            <span className="text-red-400 font-medium">
-              {market.suspicious_wallet_count}
+            Wallets: <span className="text-white font-medium">{walletSummaries.length}</span>
+          </span>
+          {flaggedCount > 0 && (
+            <span className="text-xs text-red-400">
+              Flagged: <span className="font-medium">{flaggedCount}</span>
             </span>
+          )}
+          <span className="text-xs bg-gray-800 text-gray-300 px-2 py-0.5 rounded border border-gray-700">
+            {market.category}
           </span>
         </div>
       </div>
 
-      {/* Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-        <TradeTimeline
-          trades={market.trades}
-          resolvedAt={market.resolved_at}
-        />
-        <VolumeChart trades={market.trades} />
-      </div>
-
-      {/* Trades Table */}
+      {/* Wallet Table */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-        <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
-          <h2 className="text-white font-semibold text-sm flex items-center gap-2">
-            <span className="w-2 h-2 bg-blue-500 rounded-full" />
-            Trade History
+        <div className="px-4 py-3 border-b border-gray-800">
+          <h2 className="text-white font-semibold text-sm">
+            Traders ({walletSummaries.length})
           </h2>
-          <span className="text-gray-500 text-xs">
-            {market.trades.length} trades |{" "}
-            {market.trades.filter((t) => t.is_suspicious).length} flagged
-          </span>
+          <p className="text-gray-600 text-xs mt-0.5">Click a row to expand individual trades</p>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-gray-800">
-                <th className="text-left text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">
-                  Time
-                </th>
-                <th className="text-left text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">
-                  Wallet
-                </th>
-                <th className="text-left text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">
-                  Side
-                </th>
-                <th className="text-left text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">
-                  Outcome
-                </th>
-                <th className="text-right text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">
-                  Amount
-                </th>
-                <th className="text-right text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">
-                  Price
-                </th>
-                <th className="text-right text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">
-                  Profit
-                </th>
-                <th className="text-right text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">
-                  Status
-                </th>
+                <th className="text-left text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">Wallet</th>
+                <th className="text-right text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">Trades</th>
+                <th className="text-right text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">Volume</th>
+                <th className="text-right text-gray-500 font-medium px-4 py-2.5 text-xs uppercase tracking-wider">Profit</th>
+                <th className="w-8" />
               </tr>
             </thead>
             <tbody>
-              {sortedTrades.map((trade) => (
-                <tr
-                  key={trade.id}
-                  className={`border-b border-gray-800/50 transition-colors ${
-                    trade.is_suspicious
-                      ? "bg-red-950/20 hover:bg-red-950/30"
-                      : "hover:bg-gray-800/30"
-                  }`}
-                >
-                  <td className="px-4 py-2.5 text-gray-400 text-xs whitespace-nowrap">
-                    {new Date(trade.timestamp).toLocaleString("en-US", {
-                      month: "short",
-                      day: "numeric",
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <Link
-                      to={`/wallets/${trade.wallet_address}`}
-                      className="font-mono text-xs text-blue-400 hover:text-blue-300 transition-colors"
-                    >
-                      {truncateAddress(trade.wallet_address)}
-                    </Link>
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <span
-                      className={`text-xs font-medium ${
-                        trade.side === "BUY"
-                          ? "text-green-400"
-                          : "text-red-400"
-                      }`}
-                    >
-                      {trade.side}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5 text-gray-300 text-xs">
-                    {trade.outcome}
-                  </td>
-                  <td className="px-4 py-2.5 text-right text-gray-200 font-mono text-xs">
-                    {formatVolume(trade.amount)}
-                  </td>
-                  <td className="px-4 py-2.5 text-right text-gray-400 font-mono text-xs">
-                    {(trade.price * 100).toFixed(0)}c
-                  </td>
-                  <td className="px-4 py-2.5 text-right font-mono text-xs">
-                    {trade.profit !== null ? (
-                      <span
-                        className={
-                          trade.profit >= 0
-                            ? "text-green-400"
-                            : "text-red-400"
-                        }
-                      >
-                        {trade.profit >= 0 ? "+" : ""}
-                        {formatVolume(trade.profit)}
-                      </span>
-                    ) : (
-                      <span className="text-gray-600">--</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-2.5 text-right">
-                    {trade.is_suspicious ? (
-                      <span className="text-xs text-red-400 font-medium">
-                        FLAGGED
-                      </span>
-                    ) : (
-                      <span className="text-xs text-gray-600">--</span>
-                    )}
-                  </td>
-                </tr>
+              {walletSummaries.map((w) => (
+                <WalletRow key={w.address} wallet={w} />
               ))}
             </tbody>
           </table>
