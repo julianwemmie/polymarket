@@ -29,6 +29,7 @@ Usage:
   uv run python build_price_history.py
 """
 
+import os
 import time
 from pathlib import Path
 from datetime import timedelta
@@ -43,11 +44,12 @@ CHUNK_SIZE = 2_000_000            # Rows per chunk when reading trades.csv
 FLUSH_EVERY_N_CHUNKS = 50         # Flush accumulated data to reduce memory
 
 # ---------------------------------------------------------------------------
-# Paths (relative to this script's directory)
+# Paths (override via POLYMARKET_DATA_DIR / POLYMARKET_OUTPUT_DIR for Modal)
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
-TRADES_CSV = SCRIPT_DIR / ".." / ".." / ".." / "historical-data" / "processed" / "trades.csv"
-OUTPUT_DIR = SCRIPT_DIR / "output"
+DATA_DIR = Path(os.environ.get("POLYMARKET_DATA_DIR", str(SCRIPT_DIR / ".." / ".." / ".." / "historical-data")))
+TRADES_CSV = DATA_DIR / "processed" / "trades.csv"
+OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(SCRIPT_DIR / "output")))
 OUTPUT_FILE = OUTPUT_DIR / "price_history.parquet"
 
 # ---------------------------------------------------------------------------

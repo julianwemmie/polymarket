@@ -42,6 +42,7 @@ Usage:
   uv run python timing_score.py
 """
 
+import os
 import time
 from pathlib import Path
 
@@ -62,14 +63,15 @@ PRE_SPIKE_START_HOURS = 4
 PRE_SPIKE_END_MINUTES = 30
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths (override via POLYMARKET_DATA_DIR / POLYMARKET_OUTPUT_DIR for Modal)
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
-PRE_SPIKE_FILE = SCRIPT_DIR / "output" / "pre_spike_trades.parquet"
-SPIKES_FILE = SCRIPT_DIR / "output" / "price_spikes.parquet"
-PRICE_HISTORY_FILE = SCRIPT_DIR / "output" / "price_history.parquet"
-TRADES_CSV = SCRIPT_DIR / ".." / ".." / ".." / "historical-data" / "processed" / "trades.csv"
-OUTPUT_DIR = SCRIPT_DIR / "output"
+DATA_DIR = Path(os.environ.get("POLYMARKET_DATA_DIR", str(SCRIPT_DIR / ".." / ".." / ".." / "historical-data")))
+OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(SCRIPT_DIR / "output")))
+PRE_SPIKE_FILE = OUTPUT_DIR / "pre_spike_trades.parquet"
+SPIKES_FILE = OUTPUT_DIR / "price_spikes.parquet"
+PRICE_HISTORY_FILE = OUTPUT_DIR / "price_history.parquet"
+TRADES_CSV = DATA_DIR / "processed" / "trades.csv"
 OUTPUT_FILE = OUTPUT_DIR / "timing_scores.parquet"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

@@ -26,12 +26,13 @@ Flag: ROI > 200% with $500+ deployed and 5+ resolved bets.
 
 Output: output/roi.parquet
 """
+import os
 from pathlib import Path
 import polars as pl
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-INPUT_PATH = SCRIPT_DIR / "output" / "wallet_positions.parquet"
-OUTPUT_DIR = SCRIPT_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(SCRIPT_DIR / "output")))
+INPUT_PATH = OUTPUT_DIR / "wallet_positions.parquet"
 OUTPUT_PATH = OUTPUT_DIR / "roi.parquet"
 
 # Thresholds

@@ -26,11 +26,12 @@ to receive a final score. Wallets below this threshold are excluded.
 
 Output: output/aggregate_scores.parquet
 """
+import os
 from pathlib import Path
 import polars as pl
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = SCRIPT_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(SCRIPT_DIR / "output")))
 OUTPUT_PATH = OUTPUT_DIR / "aggregate_scores.parquet"
 
 # Minimum resolved bets to include a wallet in the aggregate

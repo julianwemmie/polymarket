@@ -39,6 +39,7 @@ Thumbs.db
 
 # Analysis outputs
 insider-trading/scripts/analysis/**/output/
+insider-trading/scripts/parallel-scrape-trades/chunks/**
 
 # Lock files (Python)
 uv.lock

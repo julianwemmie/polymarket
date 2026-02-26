@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["polars>=1.0.0", "psutil>=5.9.0"]
+# dependencies = ["polars>=1.0.0"]
 # ///
 """
 Step 0: Build per-wallet, per-market position summary from raw trades.
@@ -21,30 +21,19 @@ Output columns:
 
 Output: output/wallet_positions.parquet
 """
+import os
 from pathlib import Path
-import sys
 import polars as pl
-import psutil
 import time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-# From scripts/analysis/signal1-implausibility/, go up 3 levels to reach project root
-TRADES_PATH = SCRIPT_DIR / ".." / ".." / ".." / "historical-data" / "processed" / "trades.csv"
-MARKETS_PATH = SCRIPT_DIR / ".." / ".." / ".." / "historical-data" / "markets.csv"
-OUTPUT_DIR = SCRIPT_DIR / "output"
+DATA_DIR = Path(os.environ.get("POLYMARKET_DATA_DIR", str(SCRIPT_DIR / ".." / ".." / ".." / "historical-data")))
+TRADES_PATH = DATA_DIR / "processed" / "trades.csv"
+MARKETS_PATH = DATA_DIR / "markets.csv"
+OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(SCRIPT_DIR / "output")))
 OUTPUT_PATH = OUTPUT_DIR / "wallet_positions.parquet"
 
-# Process trades in batches of 2M rows to stay within 16 GB RAM
 BATCH_SIZE = 2_000_000
-# Compact partial aggregations every N batches to bound memory usage.
-# Without this, 76 partial agg DataFrames accumulate in a list and the
-# final pl.concat can spike memory well past 16 GB.
-COMPACT_EVERY_N_BATCHES = 10
-
-# Abort if system memory exceeds this percentage.
-MEM_LIMIT_PERCENT = 85
-# Force an early compaction if memory exceeds this percentage.
-MEM_COMPACT_PERCENT = 80
 
 
 def process_batch(df: pl.DataFrame) -> pl.DataFrame:
@@ -206,9 +195,7 @@ def main():
         batch = batches[0]
         batch_num += 1
         total_rows += len(batch)
-        pct_done = total_rows / 151_000_000 * 100
-        mem_pct_now = psutil.virtual_memory().percent
-        print(f"  Batch {batch_num}/~76: {total_rows:,.0f}/151M rows ({pct_done:.0f}%) [mem {mem_pct_now:.0f}%]", flush=True)
+        print(f"  Batch {batch_num}: {total_rows:,} rows processed", flush=True)
 
         # Get partial aggregation for this batch
         agg = process_batch(batch)
@@ -229,52 +216,6 @@ def main():
                 )
             )
             last_price_records.append(last_prices_batch)
-
-        # Check system memory and compact/abort as needed.
-        mem_pct = psutil.virtual_memory().percent
-        needs_compact = (
-            (batch_num % COMPACT_EVERY_N_BATCHES == 0 and len(partial_aggs) > 1)
-            or (mem_pct > MEM_COMPACT_PERCENT and len(partial_aggs) > 1)
-        )
-
-        if mem_pct > MEM_LIMIT_PERCENT:
-            avail_gb = psutil.virtual_memory().available / (1024 ** 3)
-            print(
-                f"\n  !! ABORTING: memory at {mem_pct:.0f}% "
-                f"({avail_gb:.1f} GB free), limit is {MEM_LIMIT_PERCENT}%"
-            )
-            sys.exit(1)
-
-        if needs_compact:
-            if mem_pct > MEM_COMPACT_PERCENT:
-                print(f"    Memory at {mem_pct:.0f}%, forcing early compaction...")
-            print(f"    Compacting {len(partial_aggs)} partial aggs...")
-            combined = pl.concat(partial_aggs)
-            partial_aggs.clear()  # free memory before group_by
-            combined = combined.group_by(["wallet", "market_id", "side"]).agg(
-                pl.col("total_usd_in").sum(),
-                pl.col("tokens_bought").sum(),
-                pl.col("total_usd_out").sum(),
-                pl.col("tokens_sold").sum(),
-                pl.col("num_trades").sum(),
-                pl.col("first_trade_timestamp").min(),
-                pl.col("last_trade_timestamp").max(),
-            )
-            partial_aggs = [combined]
-            print(f"    Compacted to {len(combined):,} rows")
-
-            # Also compact last_price_records
-            if len(last_price_records) > 1:
-                all_lp = pl.concat(last_price_records)
-                last_price_records.clear()
-                all_lp = (
-                    all_lp.sort("last_trade_ts")
-                    .unique(subset=["market_id"], keep="last")
-                )
-                last_price_records = [all_lp]
-
-            mem_after = psutil.virtual_memory().percent
-            print(f"    Memory: {mem_pct:.0f}% -> {mem_after:.0f}%")
 
     elapsed = time.time() - start
     print(f"\nPhase 1 complete: {total_rows:,} rows in {elapsed:.1f}s")

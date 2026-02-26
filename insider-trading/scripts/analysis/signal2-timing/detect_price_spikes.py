@@ -34,6 +34,7 @@ Usage:
   uv run python detect_price_spikes.py
 """
 
+import os
 import time
 from pathlib import Path
 from datetime import timedelta
@@ -52,11 +53,11 @@ MIN_TRADES_IN_WINDOW = 2          # Minimum number of trades across the spike wi
                                   # to avoid flagging low-liquidity noise
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths (override via POLYMARKET_OUTPUT_DIR for Modal)
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
-INPUT_FILE = SCRIPT_DIR / "output" / "price_history.parquet"
-OUTPUT_DIR = SCRIPT_DIR / "output"
+OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(SCRIPT_DIR / "output")))
+INPUT_FILE = OUTPUT_DIR / "price_history.parquet"
 OUTPUT_FILE = OUTPUT_DIR / "price_spikes.parquet"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

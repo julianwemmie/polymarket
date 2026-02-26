@@ -32,23 +32,24 @@ Columns produced:
   - correct_direction (bool)      True if BUY before up-spike or SELL before down-spike
 
 Strategy:
-  1. Load price_spikes.parquet into memory (should be small).
-  2. Build a lookup: market_id -> list of (spike_id, spike_start_ts, direction,
-     pre_spike_window_start, pre_spike_window_end).
-  3. Stream through trades.csv in chunks. For each chunk:
+  1. Load price_spikes.parquet and compute pre-spike time windows.
+  2. Stream through trades.csv in chunks. For each chunk:
      a. Filter to only market_ids that have spikes.
-     b. For matching trades, check if the trade timestamp falls within any
-        pre-spike window.
-     c. Emit matching (wallet, spike_id, ...) records with correct_direction flag.
-  4. Concat all matches and write to parquet.
+     b. Join trades with spike windows on market_id (vectorized).
+     c. Filter to trades where timestamp falls within the pre-spike window.
+     d. Compute correct_direction and lead_time_minutes.
+  3. Concat all matches and write to parquet.
 
-Memory: The spikes table is small. Trades are streamed in chunks.
+Memory: Spikes table stays in memory. Trades are streamed in chunks.
+  The join temporarily expands each chunk (~trades × spikes_per_market)
+  but the timestamp filter immediately reduces it.
 
 Usage:
   cd scripts/analysis/signal2-timing
   uv run python pre_spike_wallets.py
 """
 
+import os
 import time
 from pathlib import Path
 from datetime import timedelta
@@ -62,15 +63,15 @@ PRE_SPIKE_START_HOURS = 4         # How far back before spike_start to look (hou
 PRE_SPIKE_END_MINUTES = 30        # Stop looking this close to spike_start (minutes)
 CHUNK_SIZE = 2_000_000            # Rows per chunk for trades.csv
 MIN_USD_AMOUNT = 1.0              # Minimum trade size to consider (filter dust)
-COMPACT_EVERY = 20                # Compact accumulated matches to bound memory
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths (override via POLYMARKET_DATA_DIR / POLYMARKET_OUTPUT_DIR for Modal)
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
-SPIKES_FILE = SCRIPT_DIR / "output" / "price_spikes.parquet"
-TRADES_CSV = SCRIPT_DIR / ".." / ".." / ".." / "historical-data" / "processed" / "trades.csv"
-OUTPUT_DIR = SCRIPT_DIR / "output"
+DATA_DIR = Path(os.environ.get("POLYMARKET_DATA_DIR", str(SCRIPT_DIR / ".." / ".." / ".." / "historical-data")))
+OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(SCRIPT_DIR / "output")))
+SPIKES_FILE = OUTPUT_DIR / "price_spikes.parquet"
+TRADES_CSV = DATA_DIR / "processed" / "trades.csv"
 OUTPUT_FILE = OUTPUT_DIR / "pre_spike_trades.parquet"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -160,24 +161,16 @@ def main() -> None:
 
     spikes = build_spike_windows(spikes)
 
-    # Build a set of market_ids that have spikes for fast filtering
-    spike_market_ids = set(spikes["market_id"].unique().to_list())
-
-    # Build a lookup: market_id -> list of spike dicts for per-market iteration
-    spike_windows = spikes.select(
-        "spike_id", "market_id", "direction", "window_start", "window_end", "spike_start_ts",
-    )
-    spikes_by_market: dict[int, list[dict]] = {}
-    for row in spike_windows.iter_rows(named=True):
-        mid = row["market_id"]
-        if mid not in spikes_by_market:
-            spikes_by_market[mid] = []
-        spikes_by_market[mid].append(row)
-
     print(f"  Up spikes: {spikes.filter(pl.col('direction') == 'up').height:,}, "
           f"Down spikes: {spikes.filter(pl.col('direction') == 'down').height:,}", flush=True)
 
-    # Stream through trades.csv and match against spike windows
+    # Prepare spike windows DataFrame for vectorized join (replaces Python dict loop)
+    spike_windows = spikes.select(
+        "spike_id", "market_id", "direction", "window_start", "window_end", "spike_start_ts",
+    )
+    spike_market_ids = spikes["market_id"].unique().to_list()
+
+    # Stream through trades.csv and match against spike windows via join
     print(f"\n  Streaming trades.csv...", flush=True)
     reader = pl.read_csv_batched(
         TRADES_CSV,
@@ -225,7 +218,7 @@ def main() -> None:
 
         # Filter to only markets with spikes and trades above minimum size
         chunk = chunk.filter(
-            pl.col("market_id").is_in(list(spike_market_ids))
+            pl.col("market_id").is_in(spike_market_ids)
             & (pl.col("usd_amount") >= MIN_USD_AMOUNT)
         )
 
@@ -246,63 +239,56 @@ def main() -> None:
             pl.col("side").str.to_uppercase(),
         )
 
-        # Per-market iteration: for each market in this chunk, filter trades
-        # for that market, then for each spike in that market, filter trades
-        # by the time window.
-        chunk_market_ids = set(wallet_trades["market_id"].unique().to_list())
-        chunk_matches: list[pl.DataFrame] = []
+        # Pre-filter spikes to only those whose window overlaps this chunk's
+        # time range. Without this, the join explodes (1M trades × 1.3M spikes).
+        chunk_min_ts = wallet_trades["timestamp"].min()
+        chunk_max_ts = wallet_trades["timestamp"].max()
+        relevant_spikes = spike_windows.filter(
+            (pl.col("window_end") >= chunk_min_ts)
+            & (pl.col("window_start") <= chunk_max_ts)
+        )
 
-        for mid in chunk_market_ids:
-            if mid not in spikes_by_market:
-                continue
+        if len(relevant_spikes) == 0:
+            elapsed = time.time() - t0
+            pct_done = total_rows / 151_000_000 * 100
+            print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - no overlapping spikes - {elapsed:.1f}s", flush=True)
+            continue
 
-            market_trades = wallet_trades.filter(pl.col("market_id") == mid)
+        # Vectorized join: pair each trade with all temporally-relevant spikes
+        # in the same market, then filter to the exact pre-spike window.
+        joined = wallet_trades.join(relevant_spikes, on="market_id", how="inner")
 
-            for spike in spikes_by_market[mid]:
-                # Filter trades to the pre-spike window BEFORE any join
-                spike_trades = market_trades.filter(
-                    (pl.col("timestamp") >= spike["window_start"])
-                    & (pl.col("timestamp") <= spike["window_end"])
-                )
+        matched = joined.filter(
+            (pl.col("timestamp") >= pl.col("window_start"))
+            & (pl.col("timestamp") <= pl.col("window_end"))
+        )
 
-                if len(spike_trades) == 0:
-                    continue
-
-                # Add spike columns and compute derived fields
-                spike_trades = spike_trades.with_columns(
-                    pl.lit(spike["spike_id"]).alias("spike_id"),
-                    pl.lit(spike["direction"]).alias("direction"),
-                    pl.lit(spike["spike_start_ts"]).alias("spike_start_ts"),
-                )
-
-                spike_trades = spike_trades.with_columns(
-                    ((pl.col("spike_start_ts") - pl.col("timestamp")).dt.total_minutes()).alias("lead_time_minutes"),
-                    (
-                        ((pl.col("side") == "BUY") & (pl.col("direction") == "up"))
-                        | ((pl.col("side") == "SELL") & (pl.col("direction") == "down"))
-                    ).alias("correct_direction"),
-                ).select(
-                    "wallet",
-                    "market_id",
-                    "spike_id",
-                    pl.col("timestamp").alias("entry_timestamp"),
-                    "lead_time_minutes",
-                    "usd_amount",
-                    pl.col("price").alias("entry_price"),
-                    "direction",
-                    "side",
-                    "correct_direction",
-                )
-
-                chunk_matches.append(spike_trades)
-
-        if not chunk_matches:
+        if len(matched) == 0:
             elapsed = time.time() - t0
             pct_done = total_rows / 151_000_000 * 100
             print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - 0 temporal matches - {elapsed:.1f}s", flush=True)
             continue
 
-        matched = pl.concat(chunk_matches)
+        # Compute derived fields
+        matched = matched.with_columns(
+            ((pl.col("spike_start_ts") - pl.col("timestamp")).dt.total_minutes()).alias("lead_time_minutes"),
+            (
+                ((pl.col("side") == "BUY") & (pl.col("direction") == "up"))
+                | ((pl.col("side") == "SELL") & (pl.col("direction") == "down"))
+            ).alias("correct_direction"),
+        ).select(
+            "wallet",
+            "market_id",
+            "spike_id",
+            pl.col("timestamp").alias("entry_timestamp"),
+            "lead_time_minutes",
+            "usd_amount",
+            pl.col("price").alias("entry_price"),
+            "direction",
+            "side",
+            "correct_direction",
+        )
+
         all_matches.append(matched)
         total_matches += len(matched)
 
@@ -310,10 +296,6 @@ def main() -> None:
         pct_done = total_rows / 151_000_000 * 100
         print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - "
               f"{total_matches:,} total matches - {elapsed:.1f}s", flush=True)
-
-        # Periodically compact to bound memory
-        if chunk_count % COMPACT_EVERY == 0 and len(all_matches) > 1:
-            all_matches = [pl.concat(all_matches)]
 
     # Combine all matches
     if not all_matches:
