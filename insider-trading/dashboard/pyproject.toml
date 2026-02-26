@@ -1,0 +1,14 @@
+[project]
+name = "polymarket-dashboard"
+version = "0.1.0"
+description = "Insider trading detection dashboard for Polymarket"
+requires-python = ">=3.12"
+dependencies = [
+    "streamlit>=1.40",
+    "duckdb>=1.1",
+    "plotly>=5.24",
+    "polars>=1.0",
+]
+
+[tool.uv]
+dev-dependencies = []
