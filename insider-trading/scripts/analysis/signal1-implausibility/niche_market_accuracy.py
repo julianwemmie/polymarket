@@ -51,14 +51,16 @@ def main():
         )
 
     # Load wallet positions
-    print("Loading wallet positions...")
+    print("Loading wallet positions...", flush=True)
     positions = pl.read_parquet(INPUT_PATH)
+    print(f"  Loaded {len(positions):,} positions", flush=True)
 
     # Filter to resolved markets only
+    print("  Filtering to resolved markets...", flush=True)
     resolved = positions.filter(
         pl.col("resolution").is_in(["token1", "token2"])
     )
-    print(f"  Resolved positions: {len(resolved):,}")
+    print(f"  Resolved positions: {len(resolved):,}", flush=True)
 
     # Ensure position_won has no nulls (fill with False to prevent null propagation)
     resolved = resolved.with_columns(
@@ -67,6 +69,7 @@ def main():
 
     # Determine niche volume threshold from unique resolved markets
     # Use unique(subset="market_id") to avoid float precision issues with market_volume
+    print("  Computing niche thresholds...", flush=True)
     unique_markets = resolved.select("market_id", "market_volume").unique(subset="market_id")
     volume_threshold = unique_markets.select(
         pl.col("market_volume").quantile(NICHE_PERCENTILE)
@@ -85,6 +88,7 @@ def main():
     print(f"  Niche market positions: {len(niche_positions):,}")
 
     # Per-wallet niche market stats
+    print("  Aggregating per-wallet niche stats...", flush=True)
     wallet_stats = niche_positions.group_by("wallet").agg(
         pl.col("market_id").count().alias("niche_bet_count"),
         pl.col("position_won").sum().alias("niche_wins"),
@@ -99,6 +103,7 @@ def main():
     )
 
     # Also compute their overall win rate for comparison
+    print("  Computing overall win rates for comparison...", flush=True)
     overall_stats = resolved.group_by("wallet").agg(
         pl.col("market_id").count().alias("total_bet_count"),
         pl.col("position_won").sum().alias("total_wins"),

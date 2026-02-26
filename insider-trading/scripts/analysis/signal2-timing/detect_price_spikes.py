@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["polars>=1.0.0"]
+# ///
 """
 Signal 2 - Step 2: Detect Price Spikes
 
@@ -258,7 +262,7 @@ def main() -> None:
             "direction": pl.String,
         })
     else:
-        result = pl.concat(all_spikes)
+        result = pl.concat(all_spikes, how="diagonal_relaxed")
         # Add spike_id as UInt64 to match documented schema
         result = (
             result

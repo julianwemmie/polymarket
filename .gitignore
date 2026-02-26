@@ -37,5 +37,8 @@ Thumbs.db
 # Logs
 *.log
 
+# Analysis outputs
+insider-trading/scripts/analysis/**/output/
+
 # Lock files (Python)
 uv.lock

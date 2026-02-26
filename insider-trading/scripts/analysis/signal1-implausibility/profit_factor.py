@@ -54,14 +54,16 @@ def main():
         )
 
     # Load wallet positions
-    print("Loading wallet positions...")
+    print("Loading wallet positions...", flush=True)
     positions = pl.read_parquet(INPUT_PATH)
+    print(f"  Loaded {len(positions):,} positions", flush=True)
 
     # Filter to resolved markets only
+    print("  Filtering to resolved markets...", flush=True)
     resolved = positions.filter(
         pl.col("resolution").is_in(["token1", "token2"])
     )
-    print(f"  Resolved positions: {len(resolved):,}")
+    print(f"  Resolved positions: {len(resolved):,}", flush=True)
 
     # Ensure position_won has no nulls
     resolved = resolved.with_columns(
@@ -69,6 +71,7 @@ def main():
     )
 
     # Compute PnL per position
+    print("  Computing per-position PnL...", flush=True)
     # resolution_payout: net_tokens * $1 if won, else $0
     # net_profit = resolution_payout + total_usd_out (sell revenue) - total_usd_in (buy cost)
     resolved_with_pnl = resolved.with_columns(
@@ -92,6 +95,7 @@ def main():
     )
 
     # Per-wallet aggregation
+    print("  Aggregating per-wallet stats...", flush=True)
     wallet_stats = resolved_with_pnl.group_by("wallet").agg(
         pl.col("market_id").count().alias("resolved_bet_count"),
         pl.col("position_won").sum().alias("wins"),

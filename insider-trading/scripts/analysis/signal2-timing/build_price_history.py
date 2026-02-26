@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["polars>=1.0.0"]
+# ///
 """
 Signal 2 - Step 1: Build Price History
 

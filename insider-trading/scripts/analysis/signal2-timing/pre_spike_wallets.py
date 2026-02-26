@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["polars>=1.0.0"]
+# ///
 """
 Signal 2 - Step 3: Pre-Spike Wallets
 
@@ -58,6 +62,7 @@ PRE_SPIKE_START_HOURS = 4         # How far back before spike_start to look (hou
 PRE_SPIKE_END_MINUTES = 30        # Stop looking this close to spike_start (minutes)
 CHUNK_SIZE = 2_000_000            # Rows per chunk for trades.csv
 MIN_USD_AMOUNT = 1.0              # Minimum trade size to consider (filter dust)
+COMPACT_EVERY = 20                # Compact accumulated matches to bound memory
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -69,6 +74,19 @@ OUTPUT_DIR = SCRIPT_DIR / "output"
 OUTPUT_FILE = OUTPUT_DIR / "pre_spike_trades.parquet"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OUTPUT_SCHEMA = {
+    "wallet": pl.String,
+    "market_id": pl.Int64,
+    "spike_id": pl.UInt64,
+    "entry_timestamp": pl.Datetime,
+    "lead_time_minutes": pl.Float64,
+    "usd_amount": pl.Float64,
+    "entry_price": pl.Float64,
+    "direction": pl.String,
+    "side": pl.String,
+    "correct_direction": pl.Boolean,
+}
 
 
 def build_spike_windows(spikes: pl.DataFrame) -> pl.DataFrame:
@@ -89,11 +107,7 @@ def extract_all_wallet_trades(chunk: pl.DataFrame) -> pl.DataFrame:
     """
     Extract wallet-level trade records from a chunk, capturing BOTH buy and
     sell sides so that hit_rate can be computed downstream.
-
-    A trade has a maker and a taker. We unify them into a single table:
-      wallet, timestamp, market_id, side ("BUY"/"SELL"), price, usd_amount
     """
-    # Maker side
     maker_records = chunk.select(
         pl.col("maker").alias("wallet"),
         "timestamp",
@@ -103,7 +117,6 @@ def extract_all_wallet_trades(chunk: pl.DataFrame) -> pl.DataFrame:
         "usd_amount",
     )
 
-    # Taker side
     taker_records = chunk.select(
         pl.col("taker").alias("wallet"),
         "timestamp",
@@ -123,7 +136,7 @@ def main() -> None:
     print(f"  Output:           {OUTPUT_FILE}")
     print(f"  Pre-spike window: {PRE_SPIKE_END_MINUTES}min to {PRE_SPIKE_START_HOURS}hrs before spike")
     print(f"  Min USD amount:   ${MIN_USD_AMOUNT}")
-    print()
+    print(flush=True)
 
     if not SPIKES_FILE.exists():
         raise FileNotFoundError(
@@ -136,25 +149,13 @@ def main() -> None:
     t0 = time.time()
 
     # Load spikes and build windows
+    print("  Loading spikes...", flush=True)
     spikes = pl.read_parquet(SPIKES_FILE)
-    print(f"  Loaded {len(spikes):,} spikes across {spikes['market_id'].n_unique():,} markets")
-
-    output_schema = {
-        "wallet": pl.String,
-        "market_id": pl.Int64,
-        "spike_id": pl.UInt64,
-        "entry_timestamp": pl.Datetime,
-        "lead_time_minutes": pl.Float64,
-        "usd_amount": pl.Float64,
-        "entry_price": pl.Float64,
-        "direction": pl.String,
-        "side": pl.String,
-        "correct_direction": pl.Boolean,
-    }
+    print(f"  Loaded {len(spikes):,} spikes across {spikes['market_id'].n_unique():,} markets", flush=True)
 
     if len(spikes) == 0:
         print("No spikes to analyze. Exiting.")
-        pl.DataFrame(schema=output_schema).write_parquet(OUTPUT_FILE)
+        pl.DataFrame(schema=OUTPUT_SCHEMA).write_parquet(OUTPUT_FILE)
         return
 
     spikes = build_spike_windows(spikes)
@@ -163,7 +164,6 @@ def main() -> None:
     spike_market_ids = set(spikes["market_id"].unique().to_list())
 
     # Build a lookup: market_id -> list of spike dicts for per-market iteration
-    # This avoids the Cartesian join explosion.
     spike_windows = spikes.select(
         "spike_id", "market_id", "direction", "window_start", "window_end", "spike_start_ts",
     )
@@ -175,9 +175,10 @@ def main() -> None:
         spikes_by_market[mid].append(row)
 
     print(f"  Up spikes: {spikes.filter(pl.col('direction') == 'up').height:,}, "
-          f"Down spikes: {spikes.filter(pl.col('direction') == 'down').height:,}")
+          f"Down spikes: {spikes.filter(pl.col('direction') == 'down').height:,}", flush=True)
 
     # Stream through trades.csv and match against spike windows
+    print(f"\n  Streaming trades.csv...", flush=True)
     reader = pl.read_csv_batched(
         TRADES_CSV,
         batch_size=CHUNK_SIZE,
@@ -197,6 +198,7 @@ def main() -> None:
 
     all_matches: list[pl.DataFrame] = []
     total_rows = 0
+    total_matches = 0
     chunk_count = 0
 
     while True:
@@ -228,9 +230,9 @@ def main() -> None:
         )
 
         if len(chunk) == 0:
-            if chunk_count % 10 == 0:
-                elapsed = time.time() - t0
-                print(f"  Chunk {chunk_count} ({total_rows:,} rows) - no matches - {elapsed:.1f}s")
+            elapsed = time.time() - t0
+            pct_done = total_rows / 151_000_000 * 100
+            print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - no spike-market trades - {elapsed:.1f}s", flush=True)
             continue
 
         # Extract ALL wallet trades (both BUY and SELL) from maker+taker
@@ -246,8 +248,7 @@ def main() -> None:
 
         # Per-market iteration: for each market in this chunk, filter trades
         # for that market, then for each spike in that market, filter trades
-        # by the time window. This avoids materializing the full Cartesian
-        # product of trades x spikes.
+        # by the time window.
         chunk_market_ids = set(wallet_trades["market_id"].unique().to_list())
         chunk_matches: list[pl.DataFrame] = []
 
@@ -276,7 +277,6 @@ def main() -> None:
 
                 spike_trades = spike_trades.with_columns(
                     ((pl.col("spike_start_ts") - pl.col("timestamp")).dt.total_minutes()).alias("lead_time_minutes"),
-                    # correct_direction: BUY before up-spike or SELL before down-spike
                     (
                         ((pl.col("side") == "BUY") & (pl.col("direction") == "up"))
                         | ((pl.col("side") == "SELL") & (pl.col("direction") == "down"))
@@ -297,30 +297,32 @@ def main() -> None:
                 chunk_matches.append(spike_trades)
 
         if not chunk_matches:
-            if chunk_count % 10 == 0:
-                elapsed = time.time() - t0
-                print(f"  Chunk {chunk_count} ({total_rows:,} rows) - 0 temporal matches - {elapsed:.1f}s")
+            elapsed = time.time() - t0
+            pct_done = total_rows / 151_000_000 * 100
+            print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - 0 temporal matches - {elapsed:.1f}s", flush=True)
             continue
 
         matched = pl.concat(chunk_matches)
-
         all_matches.append(matched)
+        total_matches += len(matched)
 
-        if chunk_count % 10 == 0:
-            elapsed = time.time() - t0
-            match_count = sum(len(m) for m in all_matches)
-            print(f"  Chunk {chunk_count} ({total_rows:,} rows) - "
-                  f"{match_count:,} pre-spike trades found - {elapsed:.1f}s")
+        elapsed = time.time() - t0
+        pct_done = total_rows / 151_000_000 * 100
+        print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - "
+              f"{total_matches:,} total matches - {elapsed:.1f}s", flush=True)
+
+        # Periodically compact to bound memory
+        if chunk_count % COMPACT_EVERY == 0 and len(all_matches) > 1:
+            all_matches = [pl.concat(all_matches)]
 
     # Combine all matches
     if not all_matches:
         print("\nNo pre-spike trades found.")
-        result = pl.DataFrame(schema=output_schema)
+        result = pl.DataFrame(schema=OUTPUT_SCHEMA)
     else:
+        print(f"\n  Combining {len(all_matches)} match batches...", flush=True)
         result = pl.concat(all_matches)
-        # Deduplicate: same wallet + spike_id + entry_timestamp -- if there
-        # are ties (same wallet, spike, timestamp but different usd_amounts),
-        # aggregate them by summing usd_amount and keeping the mean entry_price.
+        # Deduplicate: same wallet + spike_id + entry_timestamp
         result = (
             result
             .group_by(["wallet", "spike_id", "entry_timestamp", "market_id",
@@ -333,6 +335,7 @@ def main() -> None:
         )
         result = result.sort("spike_id", "wallet", "entry_timestamp")
 
+    print(f"  Writing output...", flush=True)
     result.write_parquet(OUTPUT_FILE)
 
     elapsed = time.time() - t0

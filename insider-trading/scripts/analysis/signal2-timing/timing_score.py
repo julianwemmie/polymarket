@@ -1,3 +1,7 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["polars>=1.0.0"]
+# ///
 """
 Signal 2 - Step 4: Timing Score
 
@@ -223,7 +227,8 @@ def compute_wallet_activity_baseline(
 
         if chunk_count % 10 == 0:
             elapsed = time.time() - t0
-            print(f"    Baseline chunk {chunk_count} ({total_rows:,} rows) - {elapsed:.1f}s")
+            pct_done = total_rows / 151_000_000 * 100
+            print(f"    Baseline chunk {chunk_count}/~76 ({pct_done:.0f}%) - {elapsed:.1f}s", flush=True)
 
         # Periodically compact
         if chunk_count % 50 == 0 and len(accumulated) > 20:

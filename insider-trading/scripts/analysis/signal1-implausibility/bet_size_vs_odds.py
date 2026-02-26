@@ -53,14 +53,16 @@ def main():
         )
 
     # Load wallet positions
-    print("Loading wallet positions...")
+    print("Loading wallet positions...", flush=True)
     positions = pl.read_parquet(INPUT_PATH)
+    print(f"  Loaded {len(positions):,} positions", flush=True)
 
     # Filter to resolved markets
+    print("  Filtering to resolved markets...", flush=True)
     resolved = positions.filter(
         pl.col("resolution").is_in(["token1", "token2"])
     )
-    print(f"  Resolved positions: {len(resolved):,}")
+    print(f"  Resolved positions: {len(resolved):,}", flush=True)
 
     # Ensure position_won has no nulls
     resolved = resolved.with_columns(
@@ -68,6 +70,7 @@ def main():
     )
 
     # Add odds classification and payout calculations
+    print("  Classifying odds and computing payouts...", flush=True)
     resolved_with_odds = resolved.with_columns(
         # Potential payout in absolute USD: net_tokens * (1 - avg_entry_price)
         # This is the profit on the remaining position if the tokens win
@@ -103,6 +106,7 @@ def main():
     )
 
     # ---- Per-wallet: extreme longshot behavior (< 10%) ----
+    print("  Analyzing extreme longshots...", flush=True)
     extreme_longshots = resolved_with_odds.filter(
         pl.col("avg_entry_price") < EXTREME_LOW_ODDS
     )
@@ -119,6 +123,7 @@ def main():
     )
 
     # ---- Per-wallet: extreme high-odds behavior (> 90%) ----
+    print("  Analyzing extreme favorites...", flush=True)
     extreme_favorites = resolved_with_odds.filter(
         pl.col("avg_entry_price") > EXTREME_HIGH_ODDS
     )
@@ -137,6 +142,7 @@ def main():
     )
 
     # ---- Large bets at extreme odds (the most suspicious pattern) ----
+    print("  Analyzing large bets at extreme odds...", flush=True)
     large_extreme = resolved_with_odds.filter(
         pl.col("is_extreme_odds") & pl.col("is_large_bet")
     )
@@ -154,6 +160,7 @@ def main():
     )
 
     # ---- Overall wallet stats for context ----
+    print("  Computing overall wallet stats...", flush=True)
     overall = resolved_with_odds.group_by("wallet").agg(
         pl.col("market_id").count().alias("total_bet_count"),
         pl.col("total_usd_in").sum().alias("total_volume"),
@@ -186,6 +193,7 @@ def main():
     )
 
     # Join all stats together
+    print("  Joining all stats...", flush=True)
     wallet_stats = overall.join(longshot_stats, on="wallet", how="left")
     wallet_stats = wallet_stats.join(favorite_stats, on="wallet", how="left")
     wallet_stats = wallet_stats.join(large_extreme_stats, on="wallet", how="left")

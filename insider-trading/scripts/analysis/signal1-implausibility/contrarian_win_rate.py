@@ -43,14 +43,16 @@ def main():
         )
 
     # Load wallet positions
-    print("Loading wallet positions...")
+    print("Loading wallet positions...", flush=True)
     positions = pl.read_parquet(INPUT_PATH)
+    print(f"  Loaded {len(positions):,} positions", flush=True)
 
     # Filter to resolved markets only (token1 or token2 won)
+    print("  Filtering to resolved markets...", flush=True)
     resolved = positions.filter(
         pl.col("resolution").is_in(["token1", "token2"])
     )
-    print(f"  Resolved positions: {len(resolved):,}")
+    print(f"  Resolved positions: {len(resolved):,}", flush=True)
 
     # Ensure position_won has no nulls (fill with False to prevent null propagation in sum/count)
     resolved = resolved.with_columns(
@@ -62,9 +64,10 @@ def main():
     contrarian = resolved.filter(
         pl.col("avg_entry_price") < CONTRARIAN_PRICE_THRESHOLD
     )
-    print(f"  Contrarian positions (entry < {CONTRARIAN_PRICE_THRESHOLD}): {len(contrarian):,}")
+    print(f"  Contrarian positions (entry < {CONTRARIAN_PRICE_THRESHOLD}): {len(contrarian):,}", flush=True)
 
     # Per-wallet contrarian stats
+    print("  Aggregating per-wallet stats...", flush=True)
     wallet_stats = contrarian.group_by("wallet").agg(
         pl.col("market_id").count().alias("contrarian_bet_count"),
         pl.col("position_won").sum().alias("contrarian_wins"),

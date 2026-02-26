@@ -170,22 +170,25 @@ def main():
     # Build the combined dataframe by joining all metrics on wallet.
     # Use how="full" (Polars >=1.0 renamed "outer" to "full" for full outer joins)
     # and coalesce the wallet column from both sides after each join.
+    print(f"\n  Joining {len(loaded_metrics)} metrics...", flush=True)
     metric_names = list(loaded_metrics.keys())
     combined = loaded_metrics[metric_names[0]]
 
-    for name in metric_names[1:]:
+    for i, name in enumerate(metric_names[1:], 2):
         combined = combined.join(
             loaded_metrics[name],
             on="wallet",
             how="full",
             coalesce=True,
         )
+        print(f"    Joined {i}/{len(metric_names)}: {name} ({len(combined):,} wallets)", flush=True)
 
-    print(f"\n  Combined: {len(combined):,} unique wallets")
+    print(f"  Combined: {len(combined):,} unique wallets", flush=True)
 
     # Compute percentile rank for each metric (inline, not using dead function).
     # Skip metrics where the non-null population is below MIN_METRIC_POPULATION
     # to avoid inflated percentile scores from small populations.
+    print("  Computing percentile ranks...", flush=True)
     score_cols = []
     skipped_metrics = []
     for name in metric_names:
