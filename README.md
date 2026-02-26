@@ -4,35 +4,46 @@ Detecting insider trading on [Polymarket](https://polymarket.com) by analyzing 1
 
 ## Pipeline Overview
 
+The project is organized as a four-step pipeline. All data flows through a shared `data/` directory.
+
+```
+insider-trading/
+├── 1-scrape/       # collect raw order events
+├── 2-ingest/       # fetch markets, process orders into trades
+├── 3-analyze/      # score wallets for suspicious behavior
+├── 4-dashboard/    # Streamlit visualization
+└── data/           # shared data (gitignored)
+    ├── scrape/     #   raw chunks from step 1
+    ├── ingest/     #   markets.csv, trades.csv, goldsky/
+    └── analyze/    #   parquet outputs from step 3
+        ├── signal1/
+        └── signal2/
+```
+
+To swap in test or dummy data, set the `POLYMARKET_DATA_DIR` environment variable to an alternate `data/` directory with the same subfolder structure.
+
 ### 1. Collect raw data
 
-The pipeline has three steps: fetch markets, scrape order events, and process into trades.
-
-**Market metadata** (questions, tokens, outcomes) is fetched from Polymarket's Gamma API by `update_markets.py`.
+**Market metadata** (questions, tokens, outcomes) is fetched from Polymarket's Gamma API by `2-ingest/update_utils/update_markets.py`.
 
 **Raw `OrderFilled` events** (on-chain order fills) come from two sources:
 - Bulk historical data was downloaded from [warproxxx/poly_data](https://github.com/warproxxx/poly_data)
 - New events since the bulk download are scraped from the [Goldsky GraphQL subgraph](https://api.goldsky.com)
 
-`historical-data/` contains the original single-threaded scraper (`update_goldsky.py`), market fetcher, and trade processor. `parallel-scrape-trades/` replaces only the Goldsky scraping step with a 20-worker async scraper that partitions the time range by event density — roughly 40x faster.
+`2-ingest/` contains the original single-threaded scraper (`update_goldsky.py`), market fetcher, and trade processor. `1-scrape/` replaces only the Goldsky scraping step with a 20-worker async scraper that partitions the time range by event density — roughly 40x faster.
 
 ```
-historical-data/
-├── update_all.py                       # orchestrates all three steps
-├── update_utils/
-│   ├── update_markets.py               # fetch market metadata → markets.csv
-│   ├── update_goldsky.py               # original single-threaded Goldsky scraper
-│   ├── process_trades.py               # batch: join orders + markets → trades
-│   └── process_live.py                 # incremental: append new trades
-├── markets.csv                         # 496K markets
-├── goldsky/orderFilled.csv             # 151M raw OrderFilled events (~33 GB)
-└── processed/trades.csv                # 151M structured trades (~33 GB)
+1-scrape/
+├── scrape.py           # parallel Goldsky scraper → data/scrape/
 
-scripts/parallel-scrape-trades/
-├── scrape.py                           # parallel replacement for update_goldsky.py
-├── chunks/                             # output: one gzipped CSV per worker
-├── manifest.json                       # partition plan + per-worker checksums
-└── cursors/                            # per-worker resume state
+2-ingest/
+├── update_all.py       # orchestrates market fetch + goldsky scrape + trade processing
+├── update_utils/
+│   ├── update_markets.py    # fetch market metadata → data/ingest/markets.csv
+│   ├── update_goldsky.py    # single-threaded Goldsky scraper → data/ingest/goldsky/
+│   ├── process_trades.py    # batch: join orders + markets → trades
+│   └── process_live.py      # incremental: append new trades
+└── poly_utils/              # shared utilities (market loading, etc.)
 ```
 
 ### 2. Process orders into trades
@@ -43,13 +54,13 @@ When using the parallel scraper, concatenate its output chunks first:
 
 ```bash
 # decompress and concatenate chunks into the expected input location
-zcat scripts/parallel-scrape-trades/chunks/chunk_00_*.csv.gz > historical-data/goldsky/orderFilled.csv
-for f in scripts/parallel-scrape-trades/chunks/chunk_{01..19}_*.csv.gz; do
-    zcat "$f" | tail -n +2 >> historical-data/goldsky/orderFilled.csv
+zcat data/scrape/chunk_00_*.csv.gz > data/ingest/goldsky/orderFilled.csv
+for f in data/scrape/chunk_{01..19}_*.csv.gz; do
+    zcat "$f" | tail -n +2 >> data/ingest/goldsky/orderFilled.csv
 done
 
 # then process as usual
-cd historical-data && python update_utils/process_trades.py
+cd insider-trading/2-ingest && uv run python update_utils/process_trades.py
 ```
 
 ### 3. Analyze trades
@@ -61,15 +72,23 @@ Two signal pipelines score wallets for suspicious behavior:
 **Signal 2 — Timing Anomalies**: Builds 5-minute price history, detects price spikes (>30pp moves), finds wallets that traded in the correct direction 30min–4hrs before spikes, and scores them by hit rate.
 
 ```
-scripts/analysis/
+3-analyze/
 ├── signal1-implausibility/   # 8 metric scripts + aggregator
 ├── signal2-timing/           # 4-step pipeline
 └── modal_app.py              # cloud orchestrator
 ```
 
+### 4. Dashboard
+
+A Streamlit app for exploring results: wallet leaderboard, per-wallet drill-down, timing analysis.
+
+```bash
+cd insider-trading/4-dashboard && uv run streamlit run app.py
+```
+
 ## Running Analysis on Modal
 
-The analysis scripts in `insider-trading/scripts/analysis/` process ~33 GB of trade data. They can run locally but are memory-constrained on machines with <32 GB RAM. [Modal](https://modal.com) lets you run them in the cloud with 64 GB RAM and parallel execution.
+The analysis scripts process ~33 GB of trade data. They can run locally but are memory-constrained on machines with <32 GB RAM. [Modal](https://modal.com) lets you run them in the cloud with 64 GB RAM and parallel execution.
 
 ### Setup
 
@@ -84,16 +103,16 @@ python3 -m modal setup  # authenticate via browser
 python3 -m modal volume create polymarket-data
 
 python3 -m modal volume put polymarket-data \
-    insider-trading/historical-data/processed/trades.csv /processed/trades.csv
+    insider-trading/data/ingest/trades.csv /ingest/trades.csv
 
 python3 -m modal volume put polymarket-data \
-    insider-trading/historical-data/markets.csv /markets.csv
+    insider-trading/data/ingest/markets.csv /ingest/markets.csv
 ```
 
 ### Run
 
 ```bash
-cd insider-trading/scripts/analysis
+cd insider-trading/3-analyze
 
 # Run both signal pipelines
 python3 -m modal run modal_app.py
@@ -108,8 +127,8 @@ Signal 1 runs 8 metric scripts in parallel across separate machines. Signal 2 ru
 ### Download results
 
 ```bash
-python3 -m modal volume get polymarket-data /output/signal1/ ./output-signal1/
-python3 -m modal volume get polymarket-data /output/signal2/ ./output-signal2/
+python3 -m modal volume get polymarket-data /analyze/signal1/ insider-trading/data/analyze/signal1/
+python3 -m modal volume get polymarket-data /analyze/signal2/ insider-trading/data/analyze/signal2/
 ```
 
 ### Running locally
@@ -117,9 +136,9 @@ python3 -m modal volume get polymarket-data /output/signal2/ ./output-signal2/
 The scripts still work locally without Modal. From each signal directory:
 
 ```bash
-cd insider-trading/scripts/analysis/signal1-implausibility
+cd insider-trading/3-analyze/signal1-implausibility
 uv run run_all.py
 
-cd insider-trading/scripts/analysis/signal2-timing
+cd insider-trading/3-analyze/signal2-timing
 uv run run_all.py
 ```
