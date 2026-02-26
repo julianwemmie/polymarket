@@ -46,7 +46,7 @@ GOLDSKY_URL = (
 BATCH_SIZE = 1000  # hard limit from Goldsky
 
 # Gap boundaries
-GAP_START_TS = 1728259200   # 2025-10-07 00:00:00 UTC
+GAP_START_TS = 1759855190   # 2025-10-07 16:39:50 UTC (last record in archive)
 
 # Number of density probes to estimate event counts across the gap
 DENSITY_PROBE_COUNT = 40
