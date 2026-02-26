@@ -80,6 +80,12 @@ def main():
     )
     print(f"  Resolved positions: {len(resolved):,}")
 
+    if len(resolved) == 0:
+        print("No resolved positions found. Writing empty output.")
+        pl.DataFrame({"wallet": []}).write_parquet(str(OUTPUT_PATH))
+        print("Done!")
+        return
+
     # Fill position_won nulls before streak computation
     resolved = resolved.with_columns(
         pl.col("position_won").fill_null(False),

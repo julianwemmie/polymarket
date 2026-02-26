@@ -143,6 +143,10 @@ def main():
         metric_col = config["metric_col"]
         bet_count_col = config["bet_count_col"]
 
+        if len(df) == 0 or metric_col not in df.columns:
+            print(f"    -> 0 wallets with {name} (empty or missing columns)")
+            continue
+
         # Select wallet, metric value, and bet count
         selected = df.select(
             "wallet",

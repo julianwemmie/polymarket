@@ -46,7 +46,8 @@ GOLDSKY_URL = (
 BATCH_SIZE = 1000  # hard limit from Goldsky
 
 # Gap boundaries
-GAP_START_TS = 1759855190   # 2025-10-07 16:39:50 UTC (last record in archive)
+DEFAULT_GAP_START_TS = 1759855190   # 2025-10-07 16:39:50 UTC (last record in archive)
+GAP_START_TS = DEFAULT_GAP_START_TS
 
 # Number of density probes to estimate event counts across the gap
 DENSITY_PROBE_COUNT = 40
@@ -993,21 +994,18 @@ async def worker(
 # Main
 # ---------------------------------------------------------------------------
 
-async def main(num_workers: int, resume: bool, max_batches: int | None = None) -> None:
-    global progress
+async def main(num_workers: int, resume: bool, max_batches: int | None = None, start_ts: int | None = None) -> None:
+    global progress, GAP_START_TS
+
+    if start_ts is not None:
+        GAP_START_TS = start_ts
 
     # Bug 5: Compute GAP_END_TS at execution time, not import time
     gap_end_ts = int(datetime.now(tz=timezone.utc).timestamp())
 
-    # Bug 7: Cap workers at min(50, gap_days) to avoid pathologically many partitions
-    gap_days = max(1, int((gap_end_ts - GAP_START_TS) / 86400))
-    max_workers = min(50, gap_days)
-    if num_workers > max_workers:
-        logger.warning(
-            f"--workers={num_workers} capped to {max_workers} "
-            f"(max 50, or 1 per day of gap period)"
-        )
-        num_workers = max_workers
+    # Partition merging handles cases where workers > meaningful time slices,
+    # so no need to cap here. The API concurrency limit (MAX_CONCURRENT_REQUESTS)
+    # is the real throttle.
 
     # Initialize progress state
     progress = ProgressState(
@@ -1213,13 +1211,30 @@ def cli() -> None:
         default=None,
         help="Stop each worker after this many batches (useful for testing)",
     )
+    parser.add_argument(
+        "--start",
+        type=str,
+        default=None,
+        help="Start timestamp (unix ts) or relative like '7d', '24h', '30d' for days/hours ago",
+    )
     args = parser.parse_args()
 
     if args.workers < 1:
         print("Error: --workers must be >= 1")
         sys.exit(1)
 
-    asyncio.run(main(args.workers, args.resume, max_batches=args.max_batches))
+    start_ts = None
+    if args.start is not None:
+        s = args.start.strip().lower()
+        now = int(datetime.now(tz=timezone.utc).timestamp())
+        if s.endswith("d"):
+            start_ts = now - int(s[:-1]) * 86400
+        elif s.endswith("h"):
+            start_ts = now - int(s[:-1]) * 3600
+        else:
+            start_ts = int(s)
+
+    asyncio.run(main(args.workers, args.resume, max_batches=args.max_batches, start_ts=start_ts))
 
 
 if __name__ == "__main__":

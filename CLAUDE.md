@@ -1,0 +1,1 @@
+This project uses uv for python package management.

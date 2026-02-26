@@ -65,6 +65,12 @@ def main():
     )
     print(f"  Resolved positions: {len(resolved):,}", flush=True)
 
+    if len(resolved) == 0:
+        print("No resolved positions found. Writing empty output.")
+        pl.DataFrame({"wallet": []}).write_parquet(str(OUTPUT_PATH))
+        print("Done!")
+        return
+
     # Ensure position_won has no nulls (fill with False to prevent null propagation)
     resolved = resolved.with_columns(
         pl.col("position_won").fill_null(False),
