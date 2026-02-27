@@ -43,6 +43,77 @@ MIN_VOLUME = 1_000.0
 MIN_RESOLVED_BETS = 5
 
 
+def compute_profit_factor(positions: pl.DataFrame) -> pl.DataFrame:
+    """Compute profit factor from a positions DataFrame.
+
+    Accepts wallet_positions-format DataFrame (can be pre-filtered).
+    Returns per-wallet profit factor stats with raw values.
+    """
+    resolved = positions.filter(
+        pl.col("resolution").is_in(["token1", "token2"])
+    )
+
+    if len(resolved) == 0:
+        return pl.DataFrame({"wallet": []}, schema={"wallet": pl.String})
+
+    resolved = resolved.with_columns(
+        pl.col("position_won").fill_null(False),
+    )
+
+    resolved_with_pnl = resolved.with_columns(
+        pl.when(pl.col("position_won"))
+        .then(pl.col("net_tokens") * 1.0)
+        .otherwise(pl.lit(0.0))
+        .alias("resolution_payout"),
+    ).with_columns(
+        (pl.col("resolution_payout") + pl.col("total_usd_out") - pl.col("total_usd_in"))
+        .alias("net_pnl"),
+    ).with_columns(
+        pl.when(pl.col("net_pnl") > 0)
+        .then(pl.col("net_pnl"))
+        .otherwise(pl.lit(0.0))
+        .alias("profit"),
+        pl.when(pl.col("net_pnl") < 0)
+        .then(pl.col("net_pnl").abs())
+        .otherwise(pl.lit(0.0))
+        .alias("loss"),
+    )
+
+    wallet_stats = resolved_with_pnl.group_by("wallet").agg(
+        pl.col("market_id").count().alias("resolved_bet_count"),
+        pl.col("position_won").sum().alias("wins"),
+        pl.col("total_usd_in").sum().alias("total_volume"),
+        pl.col("profit").sum().alias("gross_profit"),
+        pl.col("loss").sum().alias("gross_loss"),
+        pl.col("net_pnl").sum().alias("net_pnl"),
+    )
+
+    wallet_stats = wallet_stats.with_columns(
+        pl.when(pl.col("gross_loss") > 0)
+        .then(pl.col("gross_profit") / pl.col("gross_loss"))
+        .otherwise(
+            pl.when(pl.col("gross_profit") > 0)
+            .then(pl.lit(999.0))
+            .otherwise(pl.lit(0.0))
+        )
+        .alias("profit_factor"),
+        (pl.col("wins") / pl.col("resolved_bet_count")).alias("win_rate"),
+    )
+
+    wallet_stats = wallet_stats.with_columns(
+        (
+            (pl.col("profit_factor") > FLAG_PROFIT_FACTOR)
+            & (pl.col("total_volume") >= MIN_VOLUME)
+            & (pl.col("resolved_bet_count") >= MIN_RESOLVED_BETS)
+        ).alias("flagged"),
+    )
+
+    return wallet_stats.sort(
+        ["flagged", "profit_factor", "total_volume"],
+        descending=[True, True, True],
+    )
+
+
 def main():
     print("=" * 60)
     print("Metric 4: Profit Factor")
@@ -56,86 +127,11 @@ def main():
             "Run build_positions.py first."
         )
 
-    # Load wallet positions
     print("Loading wallet positions...", flush=True)
     positions = pl.read_parquet(INPUT_PATH)
     print(f"  Loaded {len(positions):,} positions", flush=True)
 
-    # Filter to resolved markets only
-    print("  Filtering to resolved markets...", flush=True)
-    resolved = positions.filter(
-        pl.col("resolution").is_in(["token1", "token2"])
-    )
-    print(f"  Resolved positions: {len(resolved):,}", flush=True)
-
-    # Ensure position_won has no nulls
-    resolved = resolved.with_columns(
-        pl.col("position_won").fill_null(False),
-    )
-
-    # Compute PnL per position
-    print("  Computing per-position PnL...", flush=True)
-    # resolution_payout: net_tokens * $1 if won, else $0
-    # net_profit = resolution_payout + total_usd_out (sell revenue) - total_usd_in (buy cost)
-    resolved_with_pnl = resolved.with_columns(
-        pl.when(pl.col("position_won"))
-        .then(pl.col("net_tokens") * 1.0)
-        .otherwise(pl.lit(0.0))
-        .alias("resolution_payout"),
-    ).with_columns(
-        (pl.col("resolution_payout") + pl.col("total_usd_out") - pl.col("total_usd_in"))
-        .alias("net_pnl"),
-    ).with_columns(
-        # Separate into profit and loss components
-        pl.when(pl.col("net_pnl") > 0)
-        .then(pl.col("net_pnl"))
-        .otherwise(pl.lit(0.0))
-        .alias("profit"),
-        pl.when(pl.col("net_pnl") < 0)
-        .then(pl.col("net_pnl").abs())
-        .otherwise(pl.lit(0.0))
-        .alias("loss"),
-    )
-
-    # Per-wallet aggregation
-    print("  Aggregating per-wallet stats...", flush=True)
-    wallet_stats = resolved_with_pnl.group_by("wallet").agg(
-        pl.col("market_id").count().alias("resolved_bet_count"),
-        pl.col("position_won").sum().alias("wins"),
-        pl.col("total_usd_in").sum().alias("total_volume"),
-        pl.col("profit").sum().alias("gross_profit"),
-        pl.col("loss").sum().alias("gross_loss"),
-        pl.col("net_pnl").sum().alias("net_pnl"),
-    )
-
-    # Compute profit factor (avoid division by zero)
-    wallet_stats = wallet_stats.with_columns(
-        pl.when(pl.col("gross_loss") > 0)
-        .then(pl.col("gross_profit") / pl.col("gross_loss"))
-        .otherwise(
-            # If no losses: infinite profit factor -> cap at a high value
-            pl.when(pl.col("gross_profit") > 0)
-            .then(pl.lit(999.0))
-            .otherwise(pl.lit(0.0))
-        )
-        .alias("profit_factor"),
-        (pl.col("wins") / pl.col("resolved_bet_count")).alias("win_rate"),
-    )
-
-    # Add flag
-    wallet_stats = wallet_stats.with_columns(
-        (
-            (pl.col("profit_factor") > FLAG_PROFIT_FACTOR)
-            & (pl.col("total_volume") >= MIN_VOLUME)
-            & (pl.col("resolved_bet_count") >= MIN_RESOLVED_BETS)
-        ).alias("flagged"),
-    )
-
-    # Sort: flagged first, then by profit factor
-    wallet_stats = wallet_stats.sort(
-        ["flagged", "profit_factor", "total_volume"],
-        descending=[True, True, True],
-    )
+    wallet_stats = compute_profit_factor(positions)
 
     # Write output
     print(f"\nWriting {len(wallet_stats):,} wallet records to {OUTPUT_PATH}")

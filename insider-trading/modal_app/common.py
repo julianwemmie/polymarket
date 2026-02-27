@@ -55,3 +55,12 @@ analysis_image = _with_modal_app(
     .pip_install("polars>=1.0.0")
     .env({"POLYMARKET_DATA_DIR": VOL_PATH})
 )
+
+# Explore: on-demand analysis with both signal pipelines + DuckDB
+explore_image = _with_modal_app(
+    _base
+    .pip_install("polars>=1.0.0", "duckdb>=1.1", "pyarrow>=14.0")
+    .env({"POLYMARKET_DATA_DIR": VOL_PATH})
+    .add_local_dir("pipeline/analyze/signal1", remote_path="/app/pipeline/analyze/signal1")
+    .add_local_dir("pipeline/analyze/signal2", remote_path="/app/pipeline/analyze/signal2")
+)

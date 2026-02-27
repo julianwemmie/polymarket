@@ -84,6 +84,47 @@ def process_chunk(df: pl.DataFrame, bucket_minutes: int) -> pl.DataFrame:
     return agg
 
 
+def build_price_history_for_trades(trades_df: pl.DataFrame) -> pl.DataFrame:
+    """Build price history from a pre-filtered trades DataFrame.
+
+    Accepts trades in the standard ingest schema (can be pre-filtered by market).
+    Returns price history in the same schema as price_history.parquet.
+    """
+    bucket_minutes = PRICE_BUCKET_MINUTES
+
+    # Filter invalid rows
+    clean = trades_df.filter(
+        pl.col("price").is_not_null()
+        & pl.col("usd_amount").is_not_null()
+        & (pl.col("usd_amount") > 0)
+        & pl.col("timestamp").is_not_null()
+    )
+
+    if len(clean) == 0:
+        return pl.DataFrame(schema={
+            "market_id": pl.Int64, "bucket_start": pl.Datetime("us"),
+            "bucket_end": pl.Datetime("us"), "avg_price": pl.Float64,
+            "num_trades": pl.UInt32, "total_volume": pl.Float64,
+        })
+
+    # Select only needed columns for processing
+    clean = clean.select("timestamp", "market_id", "price", "usd_amount")
+
+    agg = process_chunk(clean, bucket_minutes)
+
+    # Compute TWAP and bucket_end
+    bucket_delta = timedelta(minutes=bucket_minutes)
+    result = agg.with_columns(
+        (pl.col("price_sum") / pl.col("num_trades").cast(pl.Float64)).alias("avg_price"),
+        (pl.col("bucket_start") + bucket_delta).alias("bucket_end"),
+    ).select(
+        "market_id", "bucket_start", "bucket_end",
+        "avg_price", "num_trades", "total_volume",
+    ).sort("market_id", "bucket_start")
+
+    return result
+
+
 def main() -> None:
     print(f"[build_price_history] Starting...")
     print(f"  Trades dir : {TRADES_DIR}")

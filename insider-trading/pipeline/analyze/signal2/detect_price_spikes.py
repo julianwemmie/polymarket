@@ -23,11 +23,9 @@ Columns produced:
   - direction (str)             "up" or "down"
 
 Strategy:
-  For each market, slide a window of SPIKE_WINDOW_MINUTES across the sorted
-  price buckets. Within each window, compare min and max avg_price. If the
-  difference exceeds SPIKE_THRESHOLD, record a spike. De-duplicate overlapping
-  spikes by keeping the window with the largest magnitude per market within
-  a cooldown period.
+  Uses Polars' native rolling window operations to compute rolling min/max
+  across all markets simultaneously in Rust, then applies a greedy cooldown
+  deduplication pass on the (much smaller) candidate set.
 
 Usage:
   cd pipeline/analyze/signal2
@@ -64,144 +62,127 @@ OUTPUT_FILE = OUTPUT_DIR / "price_spikes.parquet"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Use period 1 minute longer than window to include both endpoints
+# (Polars rolling uses a half-open interval on the left)
+ROLLING_PERIOD = f"{SPIKE_WINDOW_MINUTES + 1}m"
 
-def detect_spikes_for_market(market_df: pl.DataFrame) -> pl.DataFrame:
+
+def cooldown_dedup(candidates: pl.DataFrame) -> list[dict]:
     """
-    Given a DataFrame of price buckets for a single market (sorted by bucket_start),
-    detect all spikes exceeding the threshold within the rolling window.
+    Greedy cooldown deduplication per market.
 
-    Uses a two-pass approach:
-      1. Collect ALL candidate spikes (with temporal contiguity check).
-      2. De-duplicate by keeping the largest magnitude spike within each cooldown window.
-
-    Returns a DataFrame of spike records for this market.
+    For each market, sort candidates by magnitude descending and keep a spike
+    only if no previously-kept spike overlaps or is within COOLDOWN_MINUTES.
     """
-    empty_schema = {
-        "market_id": pl.Int64,
-        "spike_start_ts": pl.Datetime,
-        "spike_end_ts": pl.Datetime,
-        "price_before": pl.Float64,
-        "price_after": pl.Float64,
-        "magnitude_pp": pl.Float64,
-        "direction": pl.String,
-    }
-
-    if len(market_df) < 2:
-        return pl.DataFrame(schema=empty_schema)
-
-    bucket_starts = market_df["bucket_start"].to_list()
-    prices = market_df["avg_price"].to_list()
-    num_trades_col = market_df["num_trades"].to_list()
-    market_id = market_df["market_id"][0]
-
-    window_buckets = SPIKE_WINDOW_MINUTES // PRICE_BUCKET_MINUTES
-    spike_window_delta = timedelta(minutes=SPIKE_WINDOW_MINUTES)
-    n = len(bucket_starts)
-
-    # --- Pass 1: Collect ALL candidate spikes ---
-    candidates = []
-
-    for i in range(n):
-        # Determine the window end: advance j until we exceed the time window
-        # or run out of buckets.
-        j_end = i + 1
-        while j_end < n and (bucket_starts[j_end] - bucket_starts[i]) <= spike_window_delta:
-            j_end += 1
-        # j_end is now the first bucket outside the time window (exclusive)
-
-        if j_end - i < 2:
-            continue
-
-        window_prices = prices[i:j_end]
-        window_trades = num_trades_col[i:j_end]
-
-        # Skip windows with insufficient trading activity
-        total_trades_in_window = sum(window_trades)
-        if total_trades_in_window < MIN_TRADES_IN_WINDOW:
-            continue
-
-        min_price = min(window_prices)
-        max_price = max(window_prices)
-        magnitude = max_price - min_price
-
-        if magnitude < SPIKE_THRESHOLD:
-            continue
-
-        # Find positions of min and max -- use enumerate to find the first
-        # occurrence by scanning, which gives us the correct temporal position.
-        min_idx = None
-        max_idx = None
-        for k, p in enumerate(window_prices):
-            if p == min_price and min_idx is None:
-                min_idx = k
-            if p == max_price and max_idx is None:
-                max_idx = k
-
-        if min_idx < max_idx:
-            # Price went up
-            direction = "up"
-            spike_start_ts = bucket_starts[i + min_idx]
-            spike_end_ts = bucket_starts[i + max_idx]
-            price_before = min_price
-            price_after = max_price
-        else:
-            # Price went down
-            direction = "down"
-            spike_start_ts = bucket_starts[i + max_idx]
-            spike_end_ts = bucket_starts[i + min_idx]
-            price_before = max_price
-            price_after = min_price
-
-        candidates.append({
-            "market_id": market_id,
-            "spike_start_ts": spike_start_ts,
-            "spike_end_ts": spike_end_ts,
-            "price_before": price_before,
-            "price_after": price_after,
-            "magnitude_pp": magnitude,
-            "direction": direction,
-            "_window_start_idx": i,
-            "_window_end_idx": j_end - 1,
-        })
-
-    if not candidates:
-        return pl.DataFrame(schema=empty_schema)
-
-    # --- Pass 2: De-duplicate overlapping spikes ---
-    # Sort candidates by magnitude descending (greedy: keep largest first).
-    candidates.sort(key=lambda c: c["magnitude_pp"], reverse=True)
-
     cooldown_delta = timedelta(minutes=COOLDOWN_MINUTES)
-    kept = []
+    kept_rows: list[dict] = []
 
-    for candidate in candidates:
-        # Unidirectional suppression: only suppress candidates that come AFTER
-        # an already-kept spike (within cooldown). This prevents a later larger
-        # spike from retroactively suppressing an earlier legitimate one.
+    sorted_candidates = candidates.sort(
+        ["market_id", "magnitude_pp"], descending=[False, True]
+    ).to_dicts()
+
+    current_market = None
+    kept_for_market: list[dict] = []
+
+    for row in sorted_candidates:
+        if row["market_id"] != current_market:
+            current_market = row["market_id"]
+            kept_for_market = []
+
         dominated = False
-        for existing in kept:
-            # Suppress only if the candidate starts after (or overlapping with)
-            # an existing spike and within cooldown of that spike's end.
-            gap = candidate["spike_start_ts"] - existing["spike_end_ts"]
+        for existing in kept_for_market:
+            # Suppress if candidate starts after an existing spike and within cooldown
+            gap = row["spike_start_ts"] - existing["spike_end_ts"]
             if gap >= timedelta(0) and gap < cooldown_delta:
                 dominated = True
                 break
-            # Also suppress if they temporally overlap (candidate starts during existing)
-            if existing["spike_start_ts"] <= candidate["spike_start_ts"] <= existing["spike_end_ts"]:
+            # Suppress if candidate starts during an existing spike
+            if existing["spike_start_ts"] <= row["spike_start_ts"] <= existing["spike_end_ts"]:
                 dominated = True
                 break
         if not dominated:
-            kept.append(candidate)
+            kept_for_market.append(row)
+            kept_rows.append(row)
 
-    if not kept:
-        return pl.DataFrame(schema=empty_schema)
+    return kept_rows
 
-    # Drop internal bookkeeping keys before creating DataFrame
-    for spike in kept:
-        spike.pop("_window_start_idx", None)
-        spike.pop("_window_end_idx", None)
 
-    return pl.DataFrame(kept)
+def detect_spikes_for_market(price_history_df: pl.DataFrame) -> pl.DataFrame:
+    """Detect price spikes from a price history DataFrame.
+
+    Accepts price history in the same schema as price_history.parquet
+    (can be a single market or multiple markets).
+    Returns spikes in the same schema as price_spikes.parquet.
+    """
+    if len(price_history_df) == 0:
+        return pl.DataFrame(schema={
+            "spike_id": pl.UInt64, "market_id": pl.Int64,
+            "spike_start_ts": pl.Datetime("us"), "spike_end_ts": pl.Datetime("us"),
+            "price_before": pl.Float64, "price_after": pl.Float64,
+            "magnitude_pp": pl.Float64, "direction": pl.String,
+        })
+
+    price_history = price_history_df.sort("market_id", "bucket_start")
+
+    candidates = (
+        price_history
+        .rolling("bucket_start", period=ROLLING_PERIOD, group_by="market_id")
+        .agg(
+            pl.col("avg_price").max().alias("roll_max"),
+            pl.col("avg_price").min().alias("roll_min"),
+            pl.col("num_trades").sum().alias("roll_trades"),
+            pl.col("bucket_start").sort_by("avg_price", descending=True).first().alias("ts_of_max"),
+            pl.col("bucket_start").sort_by("avg_price").first().alias("ts_of_min"),
+        )
+        .filter(
+            ((pl.col("roll_max") - pl.col("roll_min")) >= SPIKE_THRESHOLD)
+            & (pl.col("roll_trades") >= MIN_TRADES_IN_WINDOW)
+        )
+        .with_columns(
+            (pl.col("roll_max") - pl.col("roll_min")).alias("magnitude_pp"),
+            pl.when(pl.col("ts_of_min") < pl.col("ts_of_max"))
+            .then(pl.lit("up")).otherwise(pl.lit("down")).alias("direction"),
+            pl.when(pl.col("ts_of_min") < pl.col("ts_of_max"))
+            .then(pl.col("roll_min")).otherwise(pl.col("roll_max")).alias("price_before"),
+            pl.when(pl.col("ts_of_min") < pl.col("ts_of_max"))
+            .then(pl.col("roll_max")).otherwise(pl.col("roll_min")).alias("price_after"),
+            pl.min_horizontal("ts_of_min", "ts_of_max").alias("spike_start_ts"),
+            pl.max_horizontal("ts_of_min", "ts_of_max").alias("spike_end_ts"),
+        )
+        .select("market_id", "spike_start_ts", "spike_end_ts",
+                "price_before", "price_after", "magnitude_pp", "direction")
+    )
+
+    if len(candidates) == 0:
+        return pl.DataFrame(schema={
+            "spike_id": pl.UInt64, "market_id": pl.Int64,
+            "spike_start_ts": pl.Datetime("us"), "spike_end_ts": pl.Datetime("us"),
+            "price_before": pl.Float64, "price_after": pl.Float64,
+            "magnitude_pp": pl.Float64, "direction": pl.String,
+        })
+
+    candidates = (
+        candidates
+        .sort("magnitude_pp", descending=True)
+        .unique(subset=["market_id", "spike_start_ts", "spike_end_ts"], keep="first")
+    )
+
+    kept_rows = cooldown_dedup(candidates)
+
+    if not kept_rows:
+        return pl.DataFrame(schema={
+            "spike_id": pl.UInt64, "market_id": pl.Int64,
+            "spike_start_ts": pl.Datetime("us"), "spike_end_ts": pl.Datetime("us"),
+            "price_before": pl.Float64, "price_after": pl.Float64,
+            "magnitude_pp": pl.Float64, "direction": pl.String,
+        })
+
+    return (
+        pl.DataFrame(kept_rows)
+        .sort("spike_start_ts")
+        .with_row_index("spike_id")
+        .cast({"spike_id": pl.UInt64})
+    )
 
 
 def main() -> None:
@@ -223,44 +204,56 @@ def main() -> None:
     t0 = time.time()
 
     # Read price history
-    print("  Loading price history...")
+    print("  Loading price history...", flush=True)
     price_history = pl.read_parquet(INPUT_FILE)
-    print(f"  Loaded {len(price_history):,} rows across "
-          f"{price_history['market_id'].n_unique():,} markets")
+    n_markets = price_history["market_id"].n_unique()
+    print(f"  Loaded {len(price_history):,} rows across {n_markets:,} markets")
 
-    # Sort by market_id, bucket_start for sliding window
+    # Sort by market_id, bucket_start for rolling window
     price_history = price_history.sort("market_id", "bucket_start")
 
-    # Process each market using partition_by for efficient grouping
-    # (avoids O(N*M) filtering the full DataFrame per market)
-    all_spikes: list[pl.DataFrame] = []
-    markets_with_spikes = 0
-    markets_processed = 0
+    # ---- Pass 1: Vectorized rolling window spike detection ----
+    print("  Computing rolling windows (vectorized)...", flush=True)
+    t1 = time.time()
 
-    market_partitions = price_history.partition_by("market_id", maintain_order=True)
-    total_markets = len(market_partitions)
-    log_interval = max(1, total_markets // 20)  # ~5% increments
+    candidates = (
+        price_history
+        .rolling("bucket_start", period=ROLLING_PERIOD, group_by="market_id")
+        .agg(
+            pl.col("avg_price").max().alias("roll_max"),
+            pl.col("avg_price").min().alias("roll_min"),
+            pl.col("num_trades").sum().alias("roll_trades"),
+            # First occurrence of max price (stable sort: earliest timestamp wins ties)
+            pl.col("bucket_start").sort_by("avg_price", descending=True).first().alias("ts_of_max"),
+            # First occurrence of min price
+            pl.col("bucket_start").sort_by("avg_price").first().alias("ts_of_min"),
+        )
+        .filter(
+            ((pl.col("roll_max") - pl.col("roll_min")) >= SPIKE_THRESHOLD)
+            & (pl.col("roll_trades") >= MIN_TRADES_IN_WINDOW)
+        )
+        .with_columns(
+            (pl.col("roll_max") - pl.col("roll_min")).alias("magnitude_pp"),
+            pl.when(pl.col("ts_of_min") < pl.col("ts_of_max"))
+            .then(pl.lit("up")).otherwise(pl.lit("down")).alias("direction"),
+            pl.when(pl.col("ts_of_min") < pl.col("ts_of_max"))
+            .then(pl.col("roll_min")).otherwise(pl.col("roll_max")).alias("price_before"),
+            pl.when(pl.col("ts_of_min") < pl.col("ts_of_max"))
+            .then(pl.col("roll_max")).otherwise(pl.col("roll_min")).alias("price_after"),
+            pl.min_horizontal("ts_of_min", "ts_of_max").alias("spike_start_ts"),
+            pl.max_horizontal("ts_of_min", "ts_of_max").alias("spike_end_ts"),
+        )
+        .select("market_id", "spike_start_ts", "spike_end_ts",
+                "price_before", "price_after", "magnitude_pp", "direction")
+    )
 
-    for market_df in market_partitions:
-        spikes_df = detect_spikes_for_market(market_df)
-        markets_processed += 1
+    elapsed_rolling = time.time() - t1
+    n_candidate_markets = candidates["market_id"].n_unique()
+    print(f"  Rolling windows: {elapsed_rolling:.1f}s | "
+          f"{len(candidates):,} candidate windows across {n_candidate_markets:,} markets",
+          flush=True)
 
-        if len(spikes_df) > 0:
-            all_spikes.append(spikes_df)
-            markets_with_spikes += 1
-
-        if markets_processed % log_interval == 0 or markets_processed == total_markets:
-            elapsed = time.time() - t0
-            pct = markets_processed / total_markets * 100
-            rate = markets_processed / elapsed if elapsed > 0 else 0
-            remaining = (total_markets - markets_processed) / rate if rate > 0 else 0
-            spike_count = sum(len(s) for s in all_spikes)
-            print(f"  [{markets_processed:,}/{total_markets:,}] {pct:.0f}% | "
-                  f"{spike_count:,} spikes | {rate:.0f} markets/s | ETA {remaining:.0f}s",
-                  flush=True)
-
-    # Combine all spikes
-    if not all_spikes:
+    if len(candidates) == 0:
         print("\nNo spikes detected. Try lowering SPIKE_THRESHOLD.")
         result = pl.DataFrame(schema={
             "spike_id": pl.UInt64,
@@ -272,11 +265,46 @@ def main() -> None:
             "magnitude_pp": pl.Float64,
             "direction": pl.String,
         })
+        result.write_parquet(OUTPUT_FILE)
+        return
+
+    # ---- Deduplicate identical spikes from overlapping windows ----
+    print("  Deduplicating identical candidates...", flush=True)
+    t2 = time.time()
+
+    candidates = (
+        candidates
+        .sort("magnitude_pp", descending=True)
+        .unique(subset=["market_id", "spike_start_ts", "spike_end_ts"], keep="first")
+    )
+
+    print(f"  Unique candidates: {len(candidates):,} ({time.time() - t2:.1f}s)", flush=True)
+
+    # ---- Pass 2: Cooldown dedup per market ----
+    print("  Applying cooldown dedup...", flush=True)
+    t3 = time.time()
+
+    kept_rows = cooldown_dedup(candidates)
+
+    elapsed_dedup = time.time() - t3
+    print(f"  Cooldown dedup: {elapsed_dedup:.1f}s | {len(kept_rows):,} spikes kept", flush=True)
+
+    # ---- Build final result ----
+    if not kept_rows:
+        print("\nNo spikes survived dedup. Try lowering SPIKE_THRESHOLD or COOLDOWN_MINUTES.")
+        result = pl.DataFrame(schema={
+            "spike_id": pl.UInt64,
+            "market_id": pl.Int64,
+            "spike_start_ts": pl.Datetime,
+            "spike_end_ts": pl.Datetime,
+            "price_before": pl.Float64,
+            "price_after": pl.Float64,
+            "magnitude_pp": pl.Float64,
+            "direction": pl.String,
+        })
     else:
-        result = pl.concat(all_spikes, how="diagonal_relaxed")
-        # Add spike_id as UInt64 to match documented schema
         result = (
-            result
+            pl.DataFrame(kept_rows)
             .sort("spike_start_ts")
             .with_row_index("spike_id")
             .cast({"spike_id": pl.UInt64})
@@ -285,8 +313,9 @@ def main() -> None:
     result.write_parquet(OUTPUT_FILE)
 
     elapsed = time.time() - t0
+    markets_with_spikes = result["market_id"].n_unique() if len(result) > 0 else 0
     print(f"\n[detect_price_spikes] Done.")
-    print(f"  Total markets processed: {markets_processed:,}")
+    print(f"  Total markets:           {n_markets:,}")
     print(f"  Total spikes detected:   {len(result):,}")
     print(f"  Markets with spikes:     {markets_with_spikes:,}")
     if len(result) > 0:

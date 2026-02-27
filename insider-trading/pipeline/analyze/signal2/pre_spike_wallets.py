@@ -145,6 +145,79 @@ def extract_all_wallet_trades(chunk: pl.DataFrame) -> pl.DataFrame:
     return combined.drop("transactionHash")
 
 
+def find_pre_spike_wallets(spikes_df: pl.DataFrame, trades_df: pl.DataFrame) -> pl.DataFrame:
+    """Find wallets that traded in pre-spike windows.
+
+    Accepts spikes (from detect_spikes_for_market) and trades DataFrames.
+    Returns pre-spike trades in the same schema as pre_spike_trades.parquet.
+    """
+    if len(spikes_df) == 0 or len(trades_df) == 0:
+        return pl.DataFrame(schema=OUTPUT_SCHEMA)
+
+    spikes = build_spike_windows(spikes_df)
+
+    spike_windows = spikes.select(
+        "spike_id", "market_id", "direction", "window_start", "window_end", "spike_start_ts",
+    )
+    spike_market_ids = spikes["market_id"].unique().to_list()
+
+    # Filter trades to spike markets and minimum size
+    chunk = trades_df.filter(
+        pl.col("market_id").is_in(spike_market_ids)
+        & (pl.col("usd_amount") >= MIN_USD_AMOUNT)
+    )
+
+    if len(chunk) == 0:
+        return pl.DataFrame(schema=OUTPUT_SCHEMA)
+
+    wallet_trades = extract_all_wallet_trades(chunk)
+
+    if len(wallet_trades) == 0:
+        return pl.DataFrame(schema=OUTPUT_SCHEMA)
+
+    wallet_trades = wallet_trades.with_columns(
+        pl.col("side").str.to_uppercase(),
+    )
+
+    joined = wallet_trades.join(spike_windows, on="market_id", how="inner")
+
+    matched = joined.filter(
+        (pl.col("timestamp") >= pl.col("window_start"))
+        & (pl.col("timestamp") <= pl.col("window_end"))
+    )
+
+    if len(matched) == 0:
+        return pl.DataFrame(schema=OUTPUT_SCHEMA)
+
+    matched = matched.with_columns(
+        ((pl.col("spike_start_ts") - pl.col("timestamp")).dt.total_minutes()).alias("lead_time_minutes"),
+        (
+            ((pl.col("side") == "BUY") & (pl.col("direction") == "up"))
+            | ((pl.col("side") == "SELL") & (pl.col("direction") == "down"))
+        ).alias("correct_direction"),
+    ).select(
+        "wallet", "market_id", "spike_id",
+        pl.col("timestamp").alias("entry_timestamp"),
+        "lead_time_minutes", "usd_amount",
+        pl.col("price").alias("entry_price"),
+        "direction", "side", "correct_direction",
+    )
+
+    # Deduplicate
+    result = (
+        matched
+        .group_by(["wallet", "spike_id", "entry_timestamp", "market_id",
+                    "direction", "side", "correct_direction"])
+        .agg(
+            pl.col("usd_amount").sum(),
+            pl.col("entry_price").mean(),
+            pl.col("lead_time_minutes").first(),
+        )
+    )
+
+    return result.sort("spike_id", "wallet", "entry_timestamp")
+
+
 def main() -> None:
     print(f"[pre_spike_wallets] Starting...")
     print(f"  Spikes file:      {SPIKES_FILE}")

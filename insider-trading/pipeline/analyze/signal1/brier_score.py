@@ -49,50 +49,29 @@ FLAG_BRIER_SKILL = 0.20  # 20%+ improvement vs consensus = suspicious
 MIN_RESOLVED_BETS = 10
 
 
-def main():
-    print("=" * 60)
-    print("Metric 5: Brier Score")
-    print("=" * 60)
+def compute_brier_score(positions: pl.DataFrame) -> pl.DataFrame:
+    """Compute Brier score metrics from a positions DataFrame.
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(
-            f"wallet_positions.parquet not found at {INPUT_PATH}. "
-            "Run build_positions.py first."
-        )
-
-    # Load wallet positions
-    print("Loading wallet positions...")
-    positions = pl.read_parquet(INPUT_PATH)
-
-    # Filter to resolved markets only
+    Accepts wallet_positions-format DataFrame (can be pre-filtered).
+    Returns per-wallet Brier score stats with raw values.
+    """
     resolved = positions.filter(
         pl.col("resolution").is_in(["token1", "token2"])
     )
-    print(f"  Resolved positions: {len(resolved):,}")
 
     if len(resolved) == 0:
-        print("No resolved positions found. Writing empty output.")
-        pl.DataFrame({"wallet": []}).write_parquet(str(OUTPUT_PATH))
-        print("Done!")
-        return
+        return pl.DataFrame({"wallet": []}, schema={"wallet": pl.String})
 
-    # Ensure position_won has no nulls
     resolved = resolved.with_columns(
         pl.col("position_won").fill_null(False),
     )
 
-    # Compute outcome: 1 if position won, 0 if lost
-    # avg_entry_price is the wallet's implied probability that this side wins (design choice).
-    # Brier score per position = (entry_price - outcome)^2
     resolved_with_brier = resolved.with_columns(
         pl.col("position_won").cast(pl.Float64).alias("outcome"),
     ).with_columns(
         ((pl.col("avg_entry_price") - pl.col("outcome")) ** 2).alias("brier_component"),
     )
 
-    # Compute market-level consensus: capital-weighted average entry price per (market_id, side)
     market_consensus = (
         resolved_with_brier
         .group_by(["market_id", "side"])
@@ -110,36 +89,26 @@ def main():
         .select("market_id", "side", "consensus_price", "consensus_brier")
     )
 
-    # Join consensus back
     resolved_with_consensus = resolved_with_brier.join(
         market_consensus, on=["market_id", "side"], how="left"
     )
 
-    # Per-wallet aggregation: use capital-weighted mean for both wallet Brier and consensus Brier
-    # This weights positions by total_usd_in so that larger bets count more toward the score.
     wallet_stats = resolved_with_consensus.group_by("wallet").agg(
         pl.col("market_id").count().alias("resolved_bet_count"),
-        # Capital-weighted Brier score
         (pl.col("brier_component") * pl.col("total_usd_in")).sum().alias("_weighted_brier"),
         (pl.col("consensus_brier") * pl.col("total_usd_in")).sum().alias("_weighted_consensus_brier"),
         pl.col("total_usd_in").sum().alias("total_volume"),
         pl.col("position_won").sum().alias("wins"),
         pl.col("avg_entry_price").mean().alias("mean_entry_price"),
     ).with_columns(
-        # Divide weighted sums by total capital to get capital-weighted mean Brier scores
         (pl.col("_weighted_brier") / pl.col("total_volume")).alias("brier_score"),
         (pl.col("_weighted_consensus_brier") / pl.col("total_volume")).alias("market_consensus_brier"),
     ).drop(["_weighted_brier", "_weighted_consensus_brier"])
 
-    # Naive Brier score (betting 0.5 on everything): (0.5 - outcome)^2 = 0.25 always
     NAIVE_BRIER = 0.25
 
     wallet_stats = wallet_stats.with_columns(
-        # Brier skill score vs naive: 1 - (brier / naive)
-        # Higher = better, >0 means better than random
         (1.0 - pl.col("brier_score") / NAIVE_BRIER).alias("brier_skill_vs_naive"),
-        # Brier skill score vs market consensus: 1 - (brier / consensus)
-        # Higher = better, >0 means better than market
         pl.when(pl.col("market_consensus_brier") > 0)
         .then(1.0 - pl.col("brier_score") / pl.col("market_consensus_brier"))
         .otherwise(pl.lit(0.0))
@@ -147,8 +116,6 @@ def main():
         (pl.col("wins") / pl.col("resolved_bet_count")).alias("win_rate"),
     )
 
-    # Add flag: based on relative improvement vs consensus (not absolute Brier)
-    # Per the plan: "wallet Brier score significantly better than market consensus"
     wallet_stats = wallet_stats.with_columns(
         (
             (pl.col("brier_skill_vs_consensus") > FLAG_BRIER_SKILL)
@@ -156,11 +123,29 @@ def main():
         ).alias("flagged"),
     )
 
-    # Sort: flagged first, then by brier_skill_vs_consensus descending (higher = more suspicious)
-    wallet_stats = wallet_stats.sort(
+    return wallet_stats.sort(
         ["flagged", "brier_skill_vs_consensus"],
         descending=[True, True],
     )
+
+
+def main():
+    print("=" * 60)
+    print("Metric 5: Brier Score")
+    print("=" * 60)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not INPUT_PATH.exists():
+        raise FileNotFoundError(
+            f"wallet_positions.parquet not found at {INPUT_PATH}. "
+            "Run build_positions.py first."
+        )
+
+    print("Loading wallet positions...")
+    positions = pl.read_parquet(INPUT_PATH)
+
+    wallet_stats = compute_brier_score(positions)
 
     # Write output
     print(f"\nWriting {len(wallet_stats):,} wallet records to {OUTPUT_PATH}")

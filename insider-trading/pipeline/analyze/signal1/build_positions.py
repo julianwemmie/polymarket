@@ -155,6 +155,78 @@ def derive_resolution(markets: pl.DataFrame, last_prices: pl.DataFrame) -> pl.Da
     return markets_with_resolution
 
 
+def build_positions_for_trades(trades_df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
+    """Build wallet positions from a pre-filtered trades DataFrame.
+
+    Accepts trades in the standard ingest schema and a markets DataFrame.
+    Returns positions in the same schema as wallet_positions.parquet.
+    Suitable for on-demand analysis of a single market or wallet's trades.
+    """
+    if len(trades_df) == 0:
+        return pl.DataFrame(schema={
+            "wallet": pl.String, "market_id": pl.Int64, "side": pl.String,
+            "total_usd_in": pl.Float64, "tokens_bought": pl.Float64,
+            "total_usd_out": pl.Float64, "tokens_sold": pl.Float64,
+            "num_trades": pl.UInt32, "first_trade_timestamp": pl.Datetime("us"),
+            "last_trade_timestamp": pl.Datetime("us"), "net_tokens": pl.Float64,
+            "avg_entry_price": pl.Float64, "market_volume": pl.Float64,
+            "closed_time": pl.String, "resolution": pl.String,
+            "market_question": pl.String, "position_won": pl.Boolean,
+        })
+
+    # Process all trades as a single batch
+    positions = process_batch(trades_df)
+
+    # Compute net_tokens and avg_entry_price
+    positions = positions.with_columns(
+        pl.max_horizontal(pl.col("tokens_bought") - pl.col("tokens_sold"), pl.lit(0.0)).alias("net_tokens"),
+        pl.when(pl.col("tokens_bought") > 0)
+        .then(pl.col("total_usd_in") / pl.col("tokens_bought"))
+        .otherwise(pl.lit(None))
+        .alias("avg_entry_price"),
+    )
+
+    # Derive last trade prices for resolution
+    token1_trades = trades_df.filter(pl.col("nonusdc_side") == "token1")
+    if len(token1_trades) > 0:
+        final_last_prices = (
+            token1_trades
+            .sort("timestamp")
+            .unique(subset=["market_id"], keep="last")
+            .select(
+                pl.col("market_id"),
+                pl.col("price").alias("last_price"),
+                pl.col("timestamp").alias("last_trade_ts"),
+            )
+        )
+    else:
+        final_last_prices = pl.DataFrame(schema={
+            "market_id": pl.Int64, "last_price": pl.Float64,
+            "last_trade_ts": pl.Datetime("us"),
+        })
+
+    # Derive resolution and join market info
+    markets_resolved = derive_resolution(markets_df, final_last_prices)
+    market_info = markets_resolved.select(
+        pl.col("id").cast(pl.Int64).alias("market_id"),
+        pl.col("volume").alias("market_volume"),
+        pl.col("closedTime").alias("closed_time"),
+        pl.col("resolution"),
+        pl.col("question").alias("market_question"),
+    )
+
+    positions_final = positions.join(market_info, on="market_id", how="left")
+
+    positions_final = positions_final.with_columns(
+        pl.when(pl.col("resolution").is_in(["token1", "token2"]) & (pl.col("resolution") == pl.col("side")))
+        .then(pl.lit(True))
+        .otherwise(pl.lit(False))
+        .alias("position_won"),
+    )
+
+    return positions_final
+
+
 def main():
     print("=" * 60)
     print("Building wallet positions from trades")

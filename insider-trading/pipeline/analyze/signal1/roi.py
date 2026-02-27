@@ -44,43 +44,23 @@ MIN_RESOLVED_BETS = 5
 MAX_ANNUALIZED_ROI = 100.0  # Cap at 10000% to prevent overflow
 
 
-def main():
-    print("=" * 60)
-    print("Metric 8: ROI (Return on Investment)")
-    print("=" * 60)
+def compute_roi(positions: pl.DataFrame) -> pl.DataFrame:
+    """Compute ROI metrics from a positions DataFrame.
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(
-            f"wallet_positions.parquet not found at {INPUT_PATH}. "
-            "Run build_positions.py first."
-        )
-
-    # Load wallet positions
-    print("Loading wallet positions...")
-    positions = pl.read_parquet(INPUT_PATH)
-
-    # Filter to resolved markets only
+    Accepts wallet_positions-format DataFrame (can be pre-filtered by market or wallet).
+    Returns per-wallet ROI stats with raw values (not percentile-ranked).
+    """
     resolved = positions.filter(
         pl.col("resolution").is_in(["token1", "token2"])
     )
-    print(f"  Resolved positions: {len(resolved):,}")
 
     if len(resolved) == 0:
-        print("No resolved positions found. Writing empty output.")
-        pl.DataFrame({"wallet": []}).write_parquet(str(OUTPUT_PATH))
-        print("Done!")
-        return
+        return pl.DataFrame({"wallet": []}, schema={"wallet": pl.String})
 
-    # Ensure position_won has no nulls
     resolved = resolved.with_columns(
         pl.col("position_won").fill_null(False),
     )
 
-    # Compute PnL per position using new schema with sells tracked
-    # resolution_payout = net_tokens * 1.0 if won, else 0
-    # net_pnl = resolution_payout + total_usd_out - total_usd_in
     resolved_with_pnl = resolved.with_columns(
         pl.when(pl.col("position_won"))
         .then(pl.col("net_tokens") * 1.0)
@@ -95,7 +75,6 @@ def main():
         .alias("payout"),
     )
 
-    # Per-wallet aggregation
     wallet_stats = resolved_with_pnl.group_by("wallet").agg(
         pl.col("market_id").count().alias("resolved_bet_count"),
         pl.col("position_won").sum().alias("wins"),
@@ -106,7 +85,6 @@ def main():
         pl.col("last_trade_timestamp").max().alias("last_trade"),
     )
 
-    # Compute ROI
     wallet_stats = wallet_stats.with_columns(
         pl.when(pl.col("total_capital_deployed") > 0)
         .then(pl.col("net_profit") / pl.col("total_capital_deployed"))
@@ -115,18 +93,13 @@ def main():
         (pl.col("wins") / pl.col("resolved_bet_count")).alias("win_rate"),
     )
 
-    # Compute trading span in days for annualized ROI.
-    # Handle both datetime and string timestamp formats robustly.
-    # first_trade and last_trade may already be datetime (from parquet) or strings.
     first_trade_col = wallet_stats.schema["first_trade"]
     if first_trade_col == pl.Utf8 or first_trade_col == pl.String:
-        # Parse string timestamps
         wallet_stats = wallet_stats.with_columns(
             pl.col("first_trade").str.to_datetime().alias("_first_dt"),
             pl.col("last_trade").str.to_datetime().alias("_last_dt"),
         )
     else:
-        # Already datetime
         wallet_stats = wallet_stats.with_columns(
             pl.col("first_trade").alias("_first_dt"),
             pl.col("last_trade").alias("_last_dt"),
@@ -135,17 +108,11 @@ def main():
     wallet_stats = wallet_stats.with_columns(
         (
             (pl.col("_last_dt").cast(pl.Int64) - pl.col("_first_dt").cast(pl.Int64))
-            .truediv(1_000_000)  # microseconds to seconds
-            .truediv(86400)  # seconds to days
+            .truediv(1_000_000)
+            .truediv(86400)
         ).alias("trading_span_days"),
     ).drop(["_first_dt", "_last_dt"])
 
-    # Annualized ROI (only meaningful if span > 30 days)
-    # Capped at MAX_ANNUALIZED_ROI to prevent overflow from short-duration wallets.
-    #
-    # Guard: if roi < -1.0, then (1 + roi) is negative and raising a negative
-    # number to a fractional power produces NaN. Clip roi to >= -1.0 BEFORE
-    # the pow() to prevent this. A -100% loss is the worst possible outcome.
     wallet_stats = wallet_stats.with_columns(
         pl.when(
             (pl.col("trading_span_days") > 30) & (pl.col("roi") >= -1.0)
@@ -156,22 +123,19 @@ def main():
         .when(
             (pl.col("trading_span_days") > 30) & (pl.col("roi") < -1.0)
         )
-        .then(pl.lit(-1.0))  # Total loss, annualized is still -100%
+        .then(pl.lit(-1.0))
         .otherwise(pl.lit(None))
         .alias("annualized_roi"),
     )
 
-    # Cap annualized ROI at reasonable bounds
     wallet_stats = wallet_stats.with_columns(
         pl.col("annualized_roi").clip(-1.0, MAX_ANNUALIZED_ROI).alias("annualized_roi"),
     )
 
-    # ROI per bet (helps distinguish "got lucky once" from "consistently good")
     wallet_stats = wallet_stats.with_columns(
         (pl.col("net_profit") / pl.col("resolved_bet_count")).alias("profit_per_bet"),
     )
 
-    # Add flag
     wallet_stats = wallet_stats.with_columns(
         (
             (pl.col("roi") > FLAG_ROI)
@@ -180,11 +144,29 @@ def main():
         ).alias("flagged"),
     )
 
-    # Sort: flagged first, then by ROI
-    wallet_stats = wallet_stats.sort(
+    return wallet_stats.sort(
         ["flagged", "roi", "total_capital_deployed"],
         descending=[True, True, True],
     )
+
+
+def main():
+    print("=" * 60)
+    print("Metric 8: ROI (Return on Investment)")
+    print("=" * 60)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not INPUT_PATH.exists():
+        raise FileNotFoundError(
+            f"wallet_positions.parquet not found at {INPUT_PATH}. "
+            "Run build_positions.py first."
+        )
+
+    print("Loading wallet positions...")
+    positions = pl.read_parquet(INPUT_PATH)
+
+    wallet_stats = compute_roi(positions)
 
     # Write output
     print(f"\nWriting {len(wallet_stats):,} wallet records to {OUTPUT_PATH}")

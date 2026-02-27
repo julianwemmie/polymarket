@@ -38,56 +38,33 @@ MIN_BETS = 3  # Need at least 3 bets for concentration to be meaningful
 NICHE_VOLUME_PERCENTILE = 0.25
 
 
-def main():
-    print("=" * 60)
-    print("Metric 6: Position Concentration")
-    print("=" * 60)
+def compute_position_concentration(positions: pl.DataFrame) -> pl.DataFrame:
+    """Compute position concentration from a positions DataFrame.
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(
-            f"wallet_positions.parquet not found at {INPUT_PATH}. "
-            "Run build_positions.py first."
-        )
-
-    # Load wallet positions
-    print("Loading wallet positions...")
-    positions = pl.read_parquet(INPUT_PATH)
-    print(f"  Total positions: {len(positions):,}")
-
-    # Filter to resolved positions only for concentration + flag logic
-    # since the flag checks "largest bet that won"
+    Accepts wallet_positions-format DataFrame (can be pre-filtered).
+    Returns per-wallet concentration stats with raw values.
+    """
     resolved = positions.filter(
         pl.col("resolution").is_in(["token1", "token2"])
     )
-    print(f"  Resolved positions: {len(resolved):,}")
 
     if len(resolved) == 0:
-        print("No resolved positions found. Writing empty output.")
-        pl.DataFrame({"wallet": []}).write_parquet(str(OUTPUT_PATH))
-        print("Done!")
-        return
+        return pl.DataFrame({"wallet": []}, schema={"wallet": pl.String})
 
-    # Ensure position_won has no nulls
     resolved = resolved.with_columns(
         pl.col("position_won").fill_null(False),
     )
 
-    # Compute niche threshold for extra context
     resolved_markets = resolved.select("market_id", "market_volume").unique(subset="market_id")
     niche_threshold = resolved_markets.select(
         pl.col("market_volume").quantile(NICHE_VOLUME_PERCENTILE)
     ).item()
-    print(f"  Niche volume threshold: ${niche_threshold:,.0f}")
 
-    # Compute per-wallet total capital across resolved positions
     wallet_totals = resolved.group_by("wallet").agg(
         pl.col("total_usd_in").sum().alias("wallet_total_capital"),
         pl.col("market_id").count().alias("total_positions"),
     )
 
-    # Join back to get capital share per position
     positions_with_share = resolved.join(wallet_totals, on="wallet", how="left")
 
     positions_with_share = positions_with_share.with_columns(
@@ -97,20 +74,13 @@ def main():
         .alias("capital_share"),
     )
 
-    # Per-wallet concentration metrics (on resolved positions only)
     wallet_stats = positions_with_share.group_by("wallet").agg(
         pl.col("total_positions").first(),
         pl.col("wallet_total_capital").first(),
-        # Max single-position concentration
         pl.col("capital_share").max().alias("max_concentration"),
-        # HHI: sum of squared shares (on resolved positions)
         (pl.col("capital_share") ** 2).sum().alias("hhi"),
     )
 
-    # Find the details of the largest position per wallet (among resolved)
-    # NOTE: Polars group_by does NOT preserve sort order, so we must use
-    # .sort_by().first() inside .agg() to reliably pick the row with the
-    # highest capital_share per wallet.
     largest_positions = (
         positions_with_share
         .group_by("wallet")
@@ -131,24 +101,20 @@ def main():
         how="left",
     )
 
-    # Fill null for largest_bet_won to prevent null propagation in flag logic
     wallet_stats = wallet_stats.with_columns(
         pl.col("largest_bet_won").fill_null(False),
     )
 
-    # Add niche flag for the largest bet
     wallet_stats = wallet_stats.with_columns(
         (pl.col("largest_bet_market_volume") <= niche_threshold).fill_null(False).alias("largest_bet_is_niche"),
     )
 
-    # Add flag: high concentration AND the concentrated bet won
     wallet_stats = wallet_stats.with_columns(
         (
             (pl.col("max_concentration") > FLAG_MAX_CONCENTRATION)
             & (pl.col("total_positions") >= MIN_BETS)
             & (pl.col("largest_bet_won") == True)
         ).alias("flagged"),
-        # Extra suspicious: concentrated on a niche market that won
         (
             (pl.col("max_concentration") > FLAG_MAX_CONCENTRATION)
             & (pl.col("total_positions") >= MIN_BETS)
@@ -157,11 +123,30 @@ def main():
         ).alias("flagged_niche"),
     )
 
-    # Sort: flagged first, then by max_concentration
-    wallet_stats = wallet_stats.sort(
+    return wallet_stats.sort(
         ["flagged_niche", "flagged", "max_concentration"],
         descending=[True, True, True],
     )
+
+
+def main():
+    print("=" * 60)
+    print("Metric 6: Position Concentration")
+    print("=" * 60)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not INPUT_PATH.exists():
+        raise FileNotFoundError(
+            f"wallet_positions.parquet not found at {INPUT_PATH}. "
+            "Run build_positions.py first."
+        )
+
+    print("Loading wallet positions...")
+    positions = pl.read_parquet(INPUT_PATH)
+    print(f"  Total positions: {len(positions):,}")
+
+    wallet_stats = compute_position_concentration(positions)
 
     # Write output
     print(f"\nWriting {len(wallet_stats):,} wallet records to {OUTPUT_PATH}")

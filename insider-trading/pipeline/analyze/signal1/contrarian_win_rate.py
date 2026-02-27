@@ -32,6 +32,56 @@ MIN_CONTRARIAN_BETS = 5
 FLAG_WIN_RATE = 0.60
 
 
+def compute_contrarian_win_rate(positions: pl.DataFrame) -> pl.DataFrame:
+    """Compute contrarian win rate from a positions DataFrame.
+
+    Accepts wallet_positions-format DataFrame (can be pre-filtered).
+    Returns per-wallet contrarian win rate stats with raw values.
+    """
+    resolved = positions.filter(
+        pl.col("resolution").is_in(["token1", "token2"])
+    )
+
+    if len(resolved) == 0:
+        return pl.DataFrame({"wallet": []}, schema={"wallet": pl.String})
+
+    resolved = resolved.with_columns(
+        pl.col("position_won").fill_null(False),
+    )
+
+    contrarian = resolved.filter(
+        pl.col("avg_entry_price") < CONTRARIAN_PRICE_THRESHOLD
+    )
+
+    if len(contrarian) == 0:
+        return pl.DataFrame({"wallet": []}, schema={"wallet": pl.String})
+
+    wallet_stats = contrarian.group_by("wallet").agg(
+        pl.col("market_id").count().alias("contrarian_bet_count"),
+        pl.col("position_won").sum().alias("contrarian_wins"),
+        pl.col("total_usd_in").sum().alias("contrarian_usd_deployed"),
+        pl.col("avg_entry_price").mean().alias("mean_contrarian_entry_price"),
+    )
+
+    wallet_stats = wallet_stats.with_columns(
+        (pl.col("contrarian_wins") / pl.col("contrarian_bet_count"))
+        .fill_null(0.0)
+        .alias("contrarian_win_rate"),
+    )
+
+    wallet_stats = wallet_stats.with_columns(
+        (
+            (pl.col("contrarian_win_rate") > FLAG_WIN_RATE)
+            & (pl.col("contrarian_bet_count") >= MIN_CONTRARIAN_BETS)
+        ).alias("flagged"),
+    )
+
+    return wallet_stats.sort(
+        ["flagged", "contrarian_win_rate", "contrarian_bet_count"],
+        descending=[True, True, True],
+    )
+
+
 def main():
     print("=" * 60)
     print("Metric 2: Contrarian Win Rate")
@@ -45,64 +95,11 @@ def main():
             "Run build_positions.py first."
         )
 
-    # Load wallet positions
     print("Loading wallet positions...", flush=True)
     positions = pl.read_parquet(INPUT_PATH)
     print(f"  Loaded {len(positions):,} positions", flush=True)
 
-    # Filter to resolved markets only (token1 or token2 won)
-    print("  Filtering to resolved markets...", flush=True)
-    resolved = positions.filter(
-        pl.col("resolution").is_in(["token1", "token2"])
-    )
-    print(f"  Resolved positions: {len(resolved):,}", flush=True)
-
-    # Ensure position_won has no nulls (fill with False to prevent null propagation in sum/count)
-    resolved = resolved.with_columns(
-        pl.col("position_won").fill_null(False),
-    )
-
-    # Filter to contrarian bets: entry price < threshold
-    # Use avg_entry_price which is VWAP of buys only (cost basis)
-    contrarian = resolved.filter(
-        pl.col("avg_entry_price") < CONTRARIAN_PRICE_THRESHOLD
-    )
-    print(f"  Contrarian positions (entry < {CONTRARIAN_PRICE_THRESHOLD}): {len(contrarian):,}", flush=True)
-
-    # Per-wallet contrarian stats
-    print("  Aggregating per-wallet stats...", flush=True)
-    wallet_stats = contrarian.group_by("wallet").agg(
-        pl.col("market_id").count().alias("contrarian_bet_count"),
-        pl.col("position_won").sum().alias("contrarian_wins"),
-        pl.col("total_usd_in").sum().alias("contrarian_usd_deployed"),
-        pl.col("avg_entry_price").mean().alias("mean_contrarian_entry_price"),
-        # Track the specific markets for context
-        pl.col("market_id").alias("contrarian_market_ids"),
-    )
-
-    # Compute win rate (contrarian_wins is guaranteed non-null after fill_null above)
-    wallet_stats = wallet_stats.with_columns(
-        (pl.col("contrarian_wins") / pl.col("contrarian_bet_count"))
-        .fill_null(0.0)
-        .alias("contrarian_win_rate"),
-    )
-
-    # Add flag
-    wallet_stats = wallet_stats.with_columns(
-        (
-            (pl.col("contrarian_win_rate") > FLAG_WIN_RATE)
-            & (pl.col("contrarian_bet_count") >= MIN_CONTRARIAN_BETS)
-        ).alias("flagged"),
-    )
-
-    # Sort by win rate descending (flagged first)
-    wallet_stats = wallet_stats.sort(
-        ["flagged", "contrarian_win_rate", "contrarian_bet_count"],
-        descending=[True, True, True],
-    )
-
-    # Drop the list column for cleaner parquet (it can be huge)
-    output = wallet_stats.drop("contrarian_market_ids")
+    output = compute_contrarian_win_rate(positions)
 
     # Write output
     print(f"\nWriting {len(output):,} wallet records to {OUTPUT_PATH}")
