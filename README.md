@@ -8,16 +8,17 @@ Detecting insider trading on [Polymarket](https://polymarket.com) by analyzing 6
 insider-trading/
 ├── pipeline/               # pure logic, no Modal imports
 │   ├── scrape/             #   data acquisition (historical, gap, markets)
-│   ├── ingest/             #   consolidate events + compute trades
+│   ├── ingest/             #   process raw scrape data into trades
 │   ├── analyze/
 │   │   ├── signal1/        #   statistical implausibility scoring
 │   │   └── signal2/        #   timing anomaly detection
 │   └── utils/              #   shared helpers
 ├── modal_app/              # thin Modal wrappers (import from pipeline/)
+├── run.py                  # CLI runner for full pipeline on Modal
 ├── dashboard/              # Streamlit visualization
 ├── data/                   # shared artifacts (gitignored)
 │   ├── scrape/             #   historical.csv, chunks, markets.csv
-│   ├── ingest/             #   orderFilled.csv, trades.csv
+│   ├── ingest/             #   trades.csv
 │   └── analyze/            #   parquet outputs
 │       ├── signal1/
 │       └── signal2/
@@ -34,7 +35,7 @@ Each pipeline stage appends its own prefix (`/scrape`, `/ingest`, `/analyze/sign
 
 ```
 /vol/scrape/          ← historical.csv, chunk_*.csv.gz, markets.csv
-/vol/ingest/          ← orderFilled.csv, trades.csv
+/vol/ingest/          ← trades.csv
 /vol/analyze/signal1/ ← parquet outputs
 /vol/analyze/signal2/ ← parquet outputs
 ```
@@ -51,11 +52,9 @@ All data acquisition lives in `pipeline/scrape/`:
 
 **Market metadata** (questions, tokens, outcomes) is fetched from Polymarket's Gamma API by `pipeline/scrape/markets.py`.
 
-### 2. Ingest: consolidate and process
+### 2. Ingest: process trades
 
-`pipeline/ingest/consolidate.py` merges the historical CSV and scraper chunks into a single `orderFilled.csv`.
-
-`pipeline/ingest/trades.py` joins raw order fills with market metadata to produce structured trades with market IDs, prices, buy/sell directions, and USD amounts.
+`pipeline/ingest/trades.py` reads directly from scrape sources (`historical.csv` + `chunk_*.csv.gz`), joins with market metadata, and produces structured trades with market IDs, prices, buy/sell directions, and USD amounts. The historical file is streamed in batches to keep memory bounded; chunk files are read individually.
 
 ### 3. Analyze trades
 
@@ -78,6 +77,28 @@ cd insider-trading && uv run streamlit run dashboard/app.py
 The entire pipeline runs on [Modal](https://modal.com) with data stored on a shared Modal volume. Only the final analysis outputs need to be downloaded locally.
 
 All `modal run` commands are run from `insider-trading/`.
+
+### Quick start with `run.py`
+
+`run.py` wraps the full pipeline with dated output directories (`/vol/runs/YYYY-MM-DD/`):
+
+```bash
+cd insider-trading
+
+python3 run.py all              # full pipeline: scrape → ingest → analyze
+
+# Or run individual stages:
+python3 run.py scrape           # historical + markets + gap
+python3 run.py scrape-gap       # gap scrape only
+python3 run.py scrape-hist      # historical download only
+python3 run.py scrape-markets   # market metadata only
+python3 run.py scan             # quick volume scan
+python3 run.py scan-full        # full scan (row counts)
+python3 run.py ingest           # process trades from scrape data
+python3 run.py analyze          # signal 1 + signal 2
+python3 run.py analyze-s1       # signal 1 only
+python3 run.py analyze-s2       # signal 2 only
+```
 
 ### Setup
 
@@ -118,7 +139,7 @@ modal run modal_app/scan.py --full
 ### Step 3: Ingest
 
 ```bash
-# Consolidate raw events + process trades (reads from /scrape/, writes to /ingest/)
+# Process trades (reads from /scrape/, writes to /ingest/)
 modal run modal_app/ingest.py
 ```
 
@@ -156,8 +177,7 @@ uv run python -m pipeline.scrape.markets            # fetch market metadata
 uv run python pipeline/scrape/scraper.py            # gap scrape (20 async workers)
 
 # Ingest
-uv run python -m pipeline.ingest.consolidate        # merge historical + chunks
-uv run python -m pipeline.ingest.trades             # process trades
+uv run python -m pipeline.ingest.trades             # process trades from scrape sources
 
 # Analyze
 uv run python pipeline/analyze/signal1/run_all.py

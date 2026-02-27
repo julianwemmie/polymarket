@@ -1,30 +1,38 @@
-"""Process raw OrderFilled events into structured trades by joining with market metadata.
+"""Process raw OrderFilled events into structured trades.
 
-Reads ingest/orderFilled.csv (produced by consolidate.py) in chunks, joins each
-chunk with markets.csv to map token IDs to markets, computes price/direction/amounts,
-and writes to ingest/trades.csv.
+Reads directly from scrape sources:
+    data/scrape/historical.csv      — bulk archive from warproxxx/poly_data
+    data/scrape/chunk_*.csv.gz      — gap scraper output (gzipped)
+
+Joins with market metadata, computes price/direction/amounts,
+and writes to data/ingest/trades.csv.
 
 Usage:
     uv run python -m pipeline.ingest.trades
 """
+
+import glob
 import os
+import re
 import time
 from pathlib import Path
 import sys
+
 import polars as pl
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-INGEST_DIR = DATA_ROOT / "ingest"
+SCRAPE_DIR = DATA_ROOT / "scrape"
 OUTPUT_DIR = DATA_ROOT / "ingest"
 
 from pipeline.utils.helpers import get_markets
 
-
-CSV_COLUMNS = ['timestamp', 'maker', 'makerAssetId', 'makerAmountFilled',
-               'taker', 'takerAssetId', 'takerAmountFilled', 'transactionHash']
+# Source paths
+HISTORICAL_PATH = SCRAPE_DIR / "historical.csv"
+CHUNKS_GLOB = str(SCRAPE_DIR / "chunk_*.csv.gz")
+CHUNK_PATTERN = re.compile(r"chunk_(\d+)_(\d{8})_(\d{8})_part(\d+)\.csv\.gz")
 
 CSV_SCHEMA = {
     "timestamp": pl.Int64,
@@ -37,16 +45,54 @@ CSV_SCHEMA = {
     "transactionHash": pl.Utf8,
 }
 
-SCHEMA_OVERRIDES = {
-    "takerAssetId": pl.Utf8,
-    "makerAssetId": pl.Utf8,
-}
-
 OUTPUT_COLUMNS = [
     'timestamp', 'market_id', 'maker', 'taker', 'nonusdc_side',
     'maker_direction', 'taker_direction', 'price', 'usd_amount',
     'token_amount', 'transactionHash',
 ]
+
+
+def _sorted_chunks() -> list[Path]:
+    """Get scraper chunk files sorted by worker ID then part number."""
+    chunks = []
+    for path in sorted(glob.glob(CHUNKS_GLOB)):
+        p = Path(path)
+        m = CHUNK_PATTERN.match(p.name)
+        if m:
+            worker_id = int(m.group(1))
+            part_num = int(m.group(4))
+            chunks.append((worker_id, part_num, p))
+    chunks.sort(key=lambda x: (x[0], x[1]))
+    return [p for _, _, p in chunks]
+
+
+def _iter_batches(chunk_size: int):
+    """Yield (source_name, DataFrame) from all scrape sources.
+
+    Historical file is streamed in batches (can be very large).
+    Chunk files are read whole (bounded by scraper part size).
+    """
+    if HISTORICAL_PATH.exists():
+        reader = pl.read_csv_batched(
+            str(HISTORICAL_PATH),
+            batch_size=chunk_size,
+            schema_overrides=CSV_SCHEMA,
+        )
+        batch_num = 0
+        while True:
+            batches = reader.next_batches(1)
+            if not batches:
+                break
+            batch_num += 1
+            yield (f"historical (batch {batch_num})", batches[0])
+
+    for chunk_path in _sorted_chunks():
+        df = pl.read_csv(
+            chunk_path,
+            schema_overrides=CSV_SCHEMA,
+        )
+        if len(df) > 0:
+            yield (chunk_path.name, df)
 
 
 def build_token_lookup():
@@ -139,78 +185,89 @@ def process_chunk(df, markets_long):
 
 
 def process_trades(
-    input_file: str = None,
     output_file: str = None,
     chunk_size: int = 5_000_000,
 ):
-    """Process raw OrderFilled events into structured trades, in chunks.
+    """Process raw OrderFilled events into structured trades.
+
+    Reads directly from scrape sources (historical + chunks),
+    processes in memory-bounded batches.
 
     Args:
-        input_file: Path to raw orderFilled CSV
         output_file: Path to write processed trades CSV
-        chunk_size: Number of rows per chunk (default 5M, ~1.6 GB memory)
+        chunk_size: Number of rows per batch for historical file (default 5M)
     """
-    if input_file is None:
-        input_file = str(INGEST_DIR / "orderFilled.csv")
     if output_file is None:
         output_file = str(OUTPUT_DIR / "trades.csv")
-    print("=" * 60)
-    print("Processing Historical Trades")
-    print("=" * 60)
 
-    # Build token lookup once
-    print("Building token lookup from markets.csv...")
+    output = Path(output_file)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    has_historical = HISTORICAL_PATH.exists()
+    chunk_files = _sorted_chunks()
+
+    print("=" * 60)
+    print("Processing Trades")
+    print("=" * 60)
+    print(f"  Historical: {HISTORICAL_PATH.name} {'(found)' if has_historical else '(not found)'}")
+    print(f"  Chunks:     {len(chunk_files)} files")
+    print(f"  Output:     {output}")
+
+    if not has_historical and not chunk_files:
+        print("\nError: No source data found. Run scraping first.")
+        return
+
+    # Rough row estimate for progress (historical ~200 B/row, gzip ~50 B/row)
+    est_rows = 0
+    if has_historical:
+        est_rows += HISTORICAL_PATH.stat().st_size // 200
+    for cf in chunk_files:
+        est_rows += cf.stat().st_size // 50
+    print(f"  Estimated:  ~{est_rows:,} rows")
+
+    print("\nBuilding token lookup from markets.csv...")
     markets_long = build_token_lookup()
-    print(f"Token mappings: {len(markets_long):,}")
-
-    os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
+    print(f"  Token mappings: {len(markets_long):,}")
 
     # Remove existing output to start fresh
-    if os.path.exists(output_file):
-        os.remove(output_file)
+    if output.exists():
+        output.unlink()
 
     total_processed = 0
-    total_start = time.time()
-    chunk_num = 0
+    batch_num = 0
+    t0 = time.time()
 
-    # Use BatchedCsvReader to stream through the file sequentially
-    reader = pl.read_csv_batched(
-        input_file,
-        batch_size=chunk_size,
-        schema_overrides=CSV_SCHEMA,
-    )
-
-    while True:
-        chunk_start = time.time()
-        batches = reader.next_batches(1)
-
-        if not batches:
-            break
-
-        df = batches[0]
-        chunk_num += 1
-
+    print()
+    for source_name, df in _iter_batches(chunk_size):
+        batch_num += 1
         processed = process_chunk(df, markets_long)
 
-        # Write: header only for first chunk
-        if chunk_num == 1:
+        # Write: header only for first batch
+        if batch_num == 1:
             processed.write_csv(output_file)
         else:
             with open(output_file, mode="a") as f:
                 processed.write_csv(f, include_header=False)
 
         total_processed += len(processed)
-        chunk_time = time.time() - chunk_start
-        elapsed = time.time() - total_start
+        elapsed = time.time() - t0
         rate = total_processed / elapsed if elapsed > 0 else 0
+        pct = min(total_processed / est_rows * 100, 99.9) if est_rows > 0 else 0
+        remaining = max(est_rows - total_processed, 0)
+        eta = remaining / rate if rate > 0 else 0
+        eta_m, eta_s = divmod(int(eta), 60)
 
-        print(f"  Chunk {chunk_num}: {len(processed):,} rows in {chunk_time:.1f}s "
-              f"| Total: {total_processed:,} "
-              f"| {rate:,.0f} rows/s")
+        print(
+            f"  [batch {batch_num}] {pct:.0f}% | "
+            f"{source_name}: {len(processed):,} rows | "
+            f"Total: {total_processed:,} | {rate:,.0f} rows/s | "
+            f"ETA {eta_m}m {eta_s:02d}s"
+        )
 
-    elapsed = time.time() - total_start
-    print(f"\nDone! Processed {total_processed:,} trades in {elapsed:.1f}s")
-    print(f"Output: {output_file}")
+    elapsed = time.time() - t0
+    file_size = output.stat().st_size
+    print(f"\nDone! {total_processed:,} trades in {elapsed:.1f}s")
+    print(f"  Output: {output} ({file_size / (1024**3):.2f} GB)")
     print("=" * 60)
 
 

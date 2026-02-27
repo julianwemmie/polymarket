@@ -1,1 +1,1 @@
-"""Data processing: consolidate raw events and compute structured trades."""
+"""Data processing: compute structured trades from raw scrape sources."""

@@ -38,7 +38,7 @@ fetch_image = _with_modal_app(
     .add_local_file("pipeline/scrape/markets.py", "/app/markets.py")
 )
 
-# Ingest: consolidate + trades processing
+# Ingest: trades processing (reads directly from scrape sources)
 # Mounts full pipeline/ so `from pipeline.utils.helpers` imports work
 ingest_image = _with_modal_app(
     _base

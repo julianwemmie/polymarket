@@ -11,7 +11,7 @@ Usage:
     python3 run.py scrape-markets  # market metadata only
     python3 run.py scan            # quick volume scan
     python3 run.py scan-full       # full volume scan (row counts)
-    python3 run.py ingest          # consolidate + trades
+    python3 run.py ingest          # process trades from scrape data
     python3 run.py analyze         # signal 1 + signal 2
     python3 run.py analyze-s1      # signal 1 only
     python3 run.py analyze-s2      # signal 2 only
