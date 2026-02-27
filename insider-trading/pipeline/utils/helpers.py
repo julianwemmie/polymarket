@@ -4,18 +4,19 @@ import polars as pl
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
-DATA_DIR = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data" / "ingest")))
+DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
+SCRAPE_DIR = DATA_ROOT / "scrape"
 
 
 def get_markets(main_file: str = None, missing_file: str = None):
-    if main_file is None:
-        main_file = str(DATA_DIR / "markets.csv")
-    if missing_file is None:
-        missing_file = str(DATA_DIR / "missing_markets.csv")
-    """
-    Load and combine markets from both files, deduplicate, and sort by createdAt.
+    """Load and combine markets from both files, deduplicate, and sort by createdAt.
+
     Returns combined Polars DataFrame sorted by creation date.
     """
+    if main_file is None:
+        main_file = str(SCRAPE_DIR / "markets.csv")
+    if missing_file is None:
+        missing_file = str(SCRAPE_DIR / "missing_markets.csv")
     schema_overrides = {
         "token1": pl.Utf8,
         "token2": pl.Utf8,

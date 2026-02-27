@@ -1,7 +1,11 @@
 """Process raw OrderFilled events into structured trades by joining with market metadata.
 
-Reads goldsky/orderFilled.csv in chunks, joins each chunk with markets.csv to map
-token IDs to markets, computes price/direction/amounts, and writes to trades.csv.
+Reads ingest/orderFilled.csv (produced by consolidate.py) in chunks, joins each
+chunk with markets.csv to map token IDs to markets, computes price/direction/amounts,
+and writes to ingest/trades.csv.
+
+Usage:
+    uv run python -m pipeline.ingest.trades
 """
 import os
 import time
@@ -12,7 +16,9 @@ import polars as pl
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-DATA_DIR = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data" / "ingest")))
+DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
+INGEST_DIR = DATA_ROOT / "ingest"
+OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT))) / "ingest"
 
 from pipeline.utils.helpers import get_markets
 
@@ -137,10 +143,6 @@ def process_trades(
     output_file: str = None,
     chunk_size: int = 5_000_000,
 ):
-    if input_file is None:
-        input_file = str(DATA_DIR / "goldsky" / "orderFilled.csv")
-    if output_file is None:
-        output_file = str(DATA_DIR / "trades.csv")
     """Process raw OrderFilled events into structured trades, in chunks.
 
     Args:
@@ -148,6 +150,10 @@ def process_trades(
         output_file: Path to write processed trades CSV
         chunk_size: Number of rows per chunk (default 5M, ~1.6 GB memory)
     """
+    if input_file is None:
+        input_file = str(INGEST_DIR / "orderFilled.csv")
+    if output_file is None:
+        output_file = str(OUTPUT_DIR / "trades.csv")
     print("=" * 60)
     print("Processing Historical Trades")
     print("=" * 60)

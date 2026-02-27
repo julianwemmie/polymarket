@@ -7,8 +7,6 @@ dependencies = [
     "polars>=1.0.0",
     "aiohttp>=3.9",
     "requests>=2.31.0",
-    "gql[requests]>=3.4.0",
-    "flatten-json>=0.1.13",
     "psutil>=5.9.0",
 ]
 

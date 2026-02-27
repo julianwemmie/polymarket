@@ -1,20 +1,40 @@
-import requests
+"""
+Fetch market metadata from Polymarket's Gamma API.
+
+Paginates through all markets, extracting questions, outcomes, token IDs,
+and other metadata. Supports resume from existing CSV.
+
+Usage:
+    uv run python -m pipeline.scrape.markets
+"""
+
 import csv
 import json
 import os
 import time
 from pathlib import Path
 
+import requests
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
-DATA_DIR = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data" / "ingest")))
+DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
+OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT))) / "scrape"
+
+OUTPUT_PATH = OUTPUT_DIR / "markets.csv"
+
+GAMMA_API_URL = "https://gamma-api.polymarket.com/markets"
+
+HEADERS = [
+    'createdAt', 'id', 'question', 'answer1', 'answer2', 'neg_risk',
+    'market_slug', 'token1', 'token2', 'condition_id', 'volume', 'ticker', 'closedTime'
+]
 
 
 def count_csv_lines(csv_filename: str) -> int:
-    """Count the number of data lines in CSV (excluding header)"""
+    """Count the number of data lines in CSV (excluding header)."""
     if not os.path.exists(csv_filename):
         return 0
-
     try:
         with open(csv_filename, 'r', encoding='utf-8') as csvfile:
             reader = csv.reader(csvfile)
@@ -25,20 +45,15 @@ def count_csv_lines(csv_filename: str) -> int:
         return 0
 
 
-def update_markets(csv_filename: str = None, batch_size: int = 500):
-    if csv_filename is None:
-        csv_filename = str(DATA_DIR / "markets.csv")
-    """
-    Fetch markets ordered by creation date and save to CSV.
+def fetch_markets(csv_filename: str = None, batch_size: int = 500):
+    """Fetch markets ordered by creation date and save to CSV.
+
     Automatically resumes from the correct offset based on existing CSV lines.
     """
+    if csv_filename is None:
+        csv_filename = str(OUTPUT_PATH)
 
-    base_url = "https://gamma-api.polymarket.com/markets"
-
-    headers = [
-        'createdAt', 'id', 'question', 'answer1', 'answer2', 'neg_risk',
-        'market_slug', 'token1', 'token2', 'condition_id', 'volume', 'ticker', 'closedTime'
-    ]
+    Path(csv_filename).parent.mkdir(parents=True, exist_ok=True)
 
     current_offset = count_csv_lines(csv_filename)
     file_exists = os.path.exists(csv_filename) and current_offset > 0
@@ -51,25 +66,23 @@ def update_markets(csv_filename: str = None, batch_size: int = 500):
         mode = 'w'
 
     total_fetched = 0
+    t0 = time.monotonic()
 
     with open(csv_filename, mode, newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
 
         if mode == 'w':
-            writer.writerow(headers)
+            writer.writerow(HEADERS)
 
         while True:
-            print(f"Fetching batch at offset {current_offset}...")
-
             try:
                 params = {
                     'order': 'createdAt',
                     'ascending': 'true',
                     'limit': batch_size,
-                    'offset': current_offset
+                    'offset': current_offset,
                 }
-
-                response = requests.get(base_url, params=params, timeout=30)
+                response = requests.get(GAMMA_API_URL, params=params, timeout=30)
 
                 if response.status_code == 500:
                     print(f"Server error (500) - retrying in 5 seconds...")
@@ -114,7 +127,6 @@ def update_markets(csv_filename: str = None, batch_size: int = 500):
                         token2 = clob_tokens[1] if len(clob_tokens) > 1 else ''
 
                         neg_risk = market.get('negRiskAugmented', False) or market.get('negRiskOther', False)
-
                         question_text = market.get('question', '') or market.get('title', '')
 
                         ticker = ''
@@ -134,7 +146,7 @@ def update_markets(csv_filename: str = None, batch_size: int = 500):
                             market.get('conditionId', ''),
                             market.get('volume', ''),
                             ticker,
-                            market.get('closedTime', '')
+                            market.get('closedTime', ''),
                         ]
 
                         writer.writerow(row)
@@ -147,7 +159,12 @@ def update_markets(csv_filename: str = None, batch_size: int = 500):
                 total_fetched += batch_count
                 current_offset += batch_count
 
-                print(f"Processed {batch_count} markets. Total new: {total_fetched}. Next offset: {current_offset}")
+                elapsed = time.monotonic() - t0
+                rate = total_fetched / elapsed if elapsed > 0 else 0
+                print(
+                    f"  [{current_offset}] +{batch_count} markets | "
+                    f"Total new: {total_fetched} | {rate:.0f} markets/s"
+                )
 
                 if len(markets) < batch_size:
                     print(f"Received only {len(markets)} markets (less than batch size). Reached end.")
@@ -164,6 +181,11 @@ def update_markets(csv_filename: str = None, batch_size: int = 500):
                 time.sleep(3)
                 continue
 
-    print(f"\nCompleted! Fetched {total_fetched} new markets.")
+    elapsed = time.monotonic() - t0
+    print(f"\nCompleted! Fetched {total_fetched} new markets in {elapsed:.0f}s.")
     print(f"Data saved to: {csv_filename}")
     print(f"Total records: {current_offset}")
+
+
+if __name__ == "__main__":
+    fetch_markets()

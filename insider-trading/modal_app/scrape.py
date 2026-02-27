@@ -1,20 +1,21 @@
 """
-Multi-machine parallel Goldsky scraper using Modal.
+Multi-machine parallel scraper + data fetchers using Modal.
 
-Distributes pipeline/scrape/scraper.py's partitioned workers across N Modal
-containers for horizontal speedup. Each container runs M async workers, all
-writing to a shared Modal Volume with uniquely-named chunk files.
+Tasks:
+    gap          Scrape recent OrderFilled events from Goldsky (default)
+    historical   Download bulk historical data from S3
+    markets      Fetch market metadata from Polymarket API
+    all          Run all three tasks
 
 Usage:
-    modal run modal_app/scrape.py                                    # 5 containers x 20 workers
-    modal run modal_app/scrape.py --containers 10                    # 10 x 20 = 200 total
-    modal run modal_app/scrape.py --containers 3 --wpc 10            # 3 x 10 = 30 total
+    modal run modal_app/scrape.py                                    # gap scrape (default)
+    modal run modal_app/scrape.py --task historical                  # download bulk archive
+    modal run modal_app/scrape.py --task markets                     # fetch market metadata
+    modal run modal_app/scrape.py --task all                         # run all three
+    modal run modal_app/scrape.py --containers 10                    # 10 x 20 = 200 workers
     modal run modal_app/scrape.py --start 7d                         # scrape last 7 days
     modal run modal_app/scrape.py --start 2026-02-23 --end 2026-02-26
     modal run modal_app/scrape.py --max-batches 5                    # test mode
-
-Download results:
-    modal volume get polymarket-data /scrape/ ./data/scrape/
 """
 
 from __future__ import annotations
@@ -23,13 +24,56 @@ from typing import Optional
 
 import modal
 
-from modal_app.common import vol, scrape_image, VOL_PATH, DEFAULT_GAP_START_TS
+from modal_app.common import vol, scrape_image, fetch_image, VOL_PATH, DEFAULT_GAP_START_TS
 
 app = modal.App("polymarket-scraper")
 
 
 # ---------------------------------------------------------------------------
-# Modal functions
+# Historical download + Markets fetch
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=fetch_image,
+    volumes={VOL_PATH: vol},
+    cpu=2,
+    memory=8192,
+    timeout=7200,
+)
+def download_historical(output_base: str = ""):
+    """Download and decompress bulk historical OrderFilled data from S3."""
+    import os
+    import sys
+    if output_base:
+        os.environ["POLYMARKET_OUTPUT_DIR"] = output_base
+    sys.path.insert(0, "/app")
+    import historical
+    historical.download_historical()
+    vol.commit()
+
+
+@app.function(
+    image=fetch_image,
+    volumes={VOL_PATH: vol},
+    cpu=2,
+    memory=4096,
+    timeout=3600,
+)
+def fetch_markets(output_base: str = ""):
+    """Fetch market metadata from Polymarket Gamma API."""
+    import os
+    import sys
+    if output_base:
+        os.environ["POLYMARKET_OUTPUT_DIR"] = output_base
+    sys.path.insert(0, "/app")
+    import markets
+    markets.fetch_markets()
+    vol.commit()
+
+
+# ---------------------------------------------------------------------------
+# Gap scraper functions
 # ---------------------------------------------------------------------------
 
 
@@ -87,6 +131,7 @@ def scrape_partition_group(
     max_batches: int | None = None,
     concurrency: int = 8,
     estimated_per_worker: int = 0,
+    output_base: str = "",
 ) -> list[dict]:
     """Scrape assigned partitions concurrently using async workers.
 
@@ -101,7 +146,11 @@ def scrape_partition_group(
     import aiohttp
 
     sys.path.insert(0, "/app")
-    os.makedirs("/vol/scrape/cursors", exist_ok=True)
+    from pathlib import Path as _Path
+    if output_base:
+        os.environ["POLYMARKET_OUTPUT_DIR"] = output_base
+    scrape_out = _Path(os.environ.get("POLYMARKET_OUTPUT_DIR", VOL_PATH)) / "scrape"
+    os.makedirs(f"{scrape_out}/cursors", exist_ok=True)
 
     import scraper
 
@@ -311,15 +360,15 @@ def _parse_ts(value: str) -> int:
 # ---------------------------------------------------------------------------
 
 
-@app.local_entrypoint()
-def main(
-    containers: int = 5,
-    wpc: int = 20,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-    max_batches: Optional[int] = None,
+def _run_gap_scrape(
+    containers: int,
+    wpc: int,
+    start: Optional[str],
+    end: Optional[str],
+    max_batches: Optional[int],
+    output_base: str = "",
 ):
-    """Orchestrate multi-machine scraping."""
+    """Run multi-machine gap scraping."""
     import math
     import time
     from datetime import datetime, timezone
@@ -424,6 +473,7 @@ def main(
                 max_batches=max_batches,
                 concurrency=per_container_concurrency,
                 estimated_per_worker=estimated_per_worker,
+                output_base=output_base,
             )
         )
 
@@ -445,7 +495,7 @@ def main(
     total_time = probe_time + scrape_time
 
     print(f"\n{'=' * 60}")
-    print("SCRAPE COMPLETE")
+    print("GAP SCRAPE COMPLETE")
     print(f"{'=' * 60}")
     print(f"  Total rows:       {total_rows:,}")
     print(f"  Total compressed: {total_size / (1024**3):.2f} GB")
@@ -463,5 +513,53 @@ def main(
         for e in errors:
             print(f"    Worker {e['worker_id']}: {e.get('error', 'unknown')}")
 
-    print(f"\nDownload results:")
-    print(f"  modal volume get polymarket-data /scrape/ ./data/scrape/")
+
+@app.local_entrypoint()
+def main(
+    task: str = "gap",
+    containers: int = 5,
+    wpc: int = 20,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    max_batches: Optional[int] = None,
+    output_dir: Optional[str] = None,
+):
+    """Orchestrate scraping tasks.
+
+    --task: gap (default), historical, markets, all
+    --output-dir: override base output directory on the volume (default: /vol)
+    """
+    out = output_dir or ""
+
+    if task == "gap":
+        _run_gap_scrape(containers, wpc, start, end, max_batches, output_base=out)
+    elif task == "historical":
+        print("Downloading historical OrderFilled data...")
+        download_historical.remote(output_base=out)
+        print("Done!")
+    elif task == "markets":
+        print("Fetching market metadata...")
+        fetch_markets.remote(output_base=out)
+        print("Done!")
+    elif task == "all":
+        # Run historical + markets in parallel, then gap scrape
+        print("Running all scrape tasks...")
+        print()
+
+        h_hist = download_historical.spawn(output_base=out)
+        h_markets = fetch_markets.spawn(output_base=out)
+
+        print("Waiting for historical download...")
+        h_hist.get()
+        print("Historical download complete!")
+
+        print("Waiting for markets fetch...")
+        h_markets.get()
+        print("Markets fetch complete!")
+
+        print()
+        _run_gap_scrape(containers, wpc, start, end, max_batches, output_base=out)
+    else:
+        raise ValueError(
+            f"Unknown task: {task}. Use 'gap', 'historical', 'markets', or 'all'."
+        )

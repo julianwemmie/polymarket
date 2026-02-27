@@ -7,8 +7,8 @@ Detecting insider trading on [Polymarket](https://polymarket.com) by analyzing 6
 ```
 insider-trading/
 ├── pipeline/               # pure logic, no Modal imports
-│   ├── scrape/             #   parallel Goldsky scraper
-│   ├── ingest/             #   fetch markets, process orders into trades
+│   ├── scrape/             #   data acquisition (historical, gap, markets)
+│   ├── ingest/             #   consolidate events + compute trades
 │   ├── analyze/
 │   │   ├── signal1/        #   statistical implausibility scoring
 │   │   └── signal2/        #   timing anomaly detection
@@ -16,49 +16,57 @@ insider-trading/
 ├── modal_app/              # thin Modal wrappers (import from pipeline/)
 ├── dashboard/              # Streamlit visualization
 ├── data/                   # shared artifacts (gitignored)
-│   ├── scrape/             #   raw chunks
-│   ├── ingest/             #   markets.csv, trades.csv, goldsky/
+│   ├── scrape/             #   historical.csv, chunks, markets.csv
+│   ├── ingest/             #   orderFilled.csv, trades.csv
 │   └── analyze/            #   parquet outputs
 │       ├── signal1/
 │       └── signal2/
 └── pyproject.toml          # single config (deps: core, [modal], [dashboard])
 ```
 
-To swap in test or dummy data, set the `POLYMARKET_DATA_DIR` environment variable to an alternate `data/` directory with the same subfolder structure.
+## Environment Variables
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `POLYMARKET_DATA_DIR` | Base directory for **reading** data | `data/` (local) or `/vol` (Modal) |
+| `POLYMARKET_OUTPUT_DIR` | Base directory for **writing** data | Falls back to `POLYMARKET_DATA_DIR` |
+
+Each pipeline stage appends its own prefix (`/scrape`, `/ingest`, `/analyze/signal{1,2}`), so a base of `/vol` produces:
+
+```
+/vol/scrape/          ← historical.csv, chunk_*.csv.gz, markets.csv
+/vol/ingest/          ← orderFilled.csv, trades.csv
+/vol/analyze/signal1/ ← parquet outputs
+/vol/analyze/signal2/ ← parquet outputs
+```
+
+To write outputs to an alternate location (e.g. a dated run), pass `--output-dir`:
+
+```bash
+modal run modal_app/scrape.py --task all --output-dir /vol/runs/2026-02-26
+# writes to /vol/runs/2026-02-26/scrape/
+
+modal run modal_app/ingest.py --output-dir /vol/runs/2026-02-26
+# writes to /vol/runs/2026-02-26/ingest/
+```
 
 ## Pipeline Overview
 
-### 1. Collect raw data
+### 1. Scrape raw data
 
-**Market metadata** (questions, tokens, outcomes) is fetched from Polymarket's Gamma API by `pipeline/ingest/markets.py`.
+All data acquisition lives in `pipeline/scrape/`:
 
-**Raw `OrderFilled` events** (on-chain order fills) come from two sources:
-- Bulk historical data was downloaded from [warproxxx/poly_data](https://github.com/warproxxx/poly_data)
-- New events since the bulk download are scraped from the [Goldsky GraphQL subgraph](https://api.goldsky.com)
+**Historical OrderFilled events** are downloaded from [warproxxx/poly_data](https://github.com/warproxxx/poly_data) by `pipeline/scrape/historical.py`. This is a one-time bulk download of on-chain order fills up to 2025-10-07.
 
-`pipeline/ingest/goldsky.py` contains the original single-threaded scraper. `pipeline/scrape/scraper.py` replaces it with a parallel scraper that partitions the time range by event density. It can run locally (20 async workers) or fan out across many Modal containers (`modal_app/scrape.py`) for horizontal scaling.
+**Gap OrderFilled events** (2025-10-07 to now) are scraped from the [Goldsky GraphQL subgraph](https://api.goldsky.com) by `pipeline/scrape/scraper.py`. It partitions the time range by event density and scrapes each partition concurrently. Runs locally (20 async workers) or fans out across Modal containers (`modal_app/scrape.py`).
 
-### 2. Process orders into trades
+**Market metadata** (questions, tokens, outcomes) is fetched from Polymarket's Gamma API by `pipeline/scrape/markets.py`.
 
-Raw order fills only have token IDs and amounts. `pipeline/ingest/trades.py` joins them with market metadata to produce structured trades with market IDs, prices, buy/sell directions, and USD amounts. `pipeline/ingest/live.py` incrementally appends new trades.
+### 2. Ingest: consolidate and process
 
-`pipeline/ingest/orchestrate.py` runs the full ingest pipeline: markets → goldsky → live processing.
+`pipeline/ingest/consolidate.py` merges the historical CSV and scraper chunks into a single `orderFilled.csv`.
 
-When using the parallel scraper, concatenate its output chunks first:
-
-```bash
-# if chunks are on Modal volume, download them first
-modal volume get polymarket-data /scrape/ insider-trading/data/scrape/
-
-# decompress and concatenate chunks into the expected input location
-zcat data/scrape/chunk_00_*.csv.gz > data/ingest/goldsky/orderFilled.csv
-for f in data/scrape/chunk_{01..19}_*.csv.gz; do
-    zcat "$f" | tail -n +2 >> data/ingest/goldsky/orderFilled.csv
-done
-
-# then process
-cd insider-trading && uv run python -m pipeline.ingest.trades
-```
+`pipeline/ingest/trades.py` joins raw order fills with market metadata to produce structured trades with market IDs, prices, buy/sell directions, and USD amounts.
 
 ### 3. Analyze trades
 
@@ -78,7 +86,7 @@ cd insider-trading && uv run streamlit run dashboard/app.py
 
 ## Running on Modal
 
-The Goldsky subgraph has 631M+ order fill events and the analysis scripts process ~33 GB of trade data. [Modal](https://modal.com) lets you run everything in the cloud with high-memory containers and parallel execution.
+The entire pipeline runs on [Modal](https://modal.com) with data stored on a shared Modal volume. Only the final analysis outputs need to be downloaded locally.
 
 All `modal run` commands are run from `insider-trading/`.
 
@@ -89,27 +97,26 @@ uv pip install modal
 python3 -m modal setup  # authenticate via browser
 ```
 
-### Scrape
+### Step 1: Scrape
 
 ```bash
-# Full scrape: 5 containers x 20 workers
-modal run modal_app/scrape.py
+# Run everything: historical download + markets + gap scrape
+modal run modal_app/scrape.py --task all
 
-# More containers for faster scraping
-modal run modal_app/scrape.py --containers 10
+# Or run individual tasks:
+modal run modal_app/scrape.py --task historical       # download bulk archive from S3
+modal run modal_app/scrape.py --task markets           # fetch market metadata
+modal run modal_app/scrape.py                          # gap scrape (default)
 
-# Scrape a specific time range
-modal run modal_app/scrape.py --start 2026-02-23 --end 2026-02-26 --containers 3 --wpc 5
-
-# Start supports relative durations, ISO dates, ISO datetimes, or unix timestamps
-modal run modal_app/scrape.py --start 7d                        # last 7 days
-modal run modal_app/scrape.py --start 2026-02-23T09:08:04       # ISO datetime
-modal run modal_app/scrape.py --start 1759855190                # unix ts
+# Gap scrape options:
+modal run modal_app/scrape.py --containers 10                    # 10 x 20 = 200 workers
+modal run modal_app/scrape.py --start 7d                         # last 7 days
+modal run modal_app/scrape.py --start 2026-02-23 --end 2026-02-26
 ```
 
-Chunks are written to the `polymarket-data` Modal volume under `/scrape/`.
+Data is written to the `polymarket-data` Modal volume under `/vol/scrape/`.
 
-### Scan (validate chunks)
+### Step 2: Scan (validate chunks)
 
 ```bash
 # Quick scan — filenames and sizes only
@@ -119,13 +126,16 @@ modal run modal_app/scan.py
 modal run modal_app/scan.py --full
 ```
 
-### Analyze
+### Step 3: Ingest
 
 ```bash
-# Upload data to Modal volume
-modal volume put polymarket-data ./data/ingest/trades.csv /ingest/trades.csv
-modal volume put polymarket-data ./data/ingest/markets.csv /ingest/markets.csv
+# Consolidate raw events + process trades (reads from /scrape/, writes to /ingest/)
+modal run modal_app/ingest.py
+```
 
+### Step 4: Analyze
+
+```bash
 # Run both signal pipelines
 modal run modal_app/analyze.py
 
@@ -139,9 +149,9 @@ Signal 1 runs 8 metric scripts in parallel across separate machines. Signal 2 ru
 ### Download results
 
 ```bash
-modal volume get polymarket-data /scrape/ insider-trading/data/scrape/
-modal volume get polymarket-data /analyze/signal1/ insider-trading/data/analyze/signal1/
-modal volume get polymarket-data /analyze/signal2/ insider-trading/data/analyze/signal2/
+# Only download the analysis outputs you need
+modal volume get polymarket-data /analyze/signal1/ ./data/analyze/signal1/
+modal volume get polymarket-data /analyze/signal2/ ./data/analyze/signal2/
 ```
 
 ### Running locally
@@ -151,7 +161,16 @@ The pipeline scripts work locally without Modal:
 ```bash
 cd insider-trading
 
-# Run analysis
+# Scrape
+uv run python -m pipeline.scrape.historical        # download bulk data
+uv run python -m pipeline.scrape.markets            # fetch market metadata
+uv run python pipeline/scrape/scraper.py            # gap scrape (20 async workers)
+
+# Ingest
+uv run python -m pipeline.ingest.consolidate        # merge historical + chunks
+uv run python -m pipeline.ingest.trades             # process trades
+
+# Analyze
 uv run python pipeline/analyze/signal1/run_all.py
 uv run python pipeline/analyze/signal2/run_all.py
 ```

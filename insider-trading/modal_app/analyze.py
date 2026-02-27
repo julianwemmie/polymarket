@@ -4,9 +4,9 @@ Modal cloud runner for Polymarket insider-trading analysis.
 Runs Signal 1 (implausibility) and Signal 2 (timing) pipelines on Modal
 with 64 GB RAM, eliminating local memory constraints.
 
-Upload data to Modal volume:
-  modal volume put polymarket-data ./data/ingest/trades.csv /ingest/trades.csv
-  modal volume put polymarket-data ./data/ingest/markets.csv /ingest/markets.csv
+Prerequisites (run scrape + ingest first):
+  modal run modal_app/scrape.py --task all
+  modal run modal_app/ingest.py
 
 Run:
   modal run modal_app/analyze.py                # run both signals

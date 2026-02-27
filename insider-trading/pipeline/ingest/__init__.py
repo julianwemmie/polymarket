@@ -1,1 +1,1 @@
-"""Market metadata and trade data ingestion."""
+"""Data processing: consolidate raw events and compute structured trades."""
