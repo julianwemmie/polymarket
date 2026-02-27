@@ -27,7 +27,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
 SCRAPE_DIR = DATA_ROOT / "scrape"
-OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT))) / "ingest"
+OUTPUT_DIR = DATA_ROOT / "ingest"
 
 HISTORICAL_PATH = SCRAPE_DIR / "historical.csv"
 CHUNKS_GLOB = str(SCRAPE_DIR / "chunk_*.csv.gz")

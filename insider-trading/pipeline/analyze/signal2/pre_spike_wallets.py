@@ -65,12 +65,12 @@ CHUNK_SIZE = 2_000_000            # Rows per chunk for trades.csv
 MIN_USD_AMOUNT = 1.0              # Minimum trade size to consider (filter dust)
 
 # ---------------------------------------------------------------------------
-# Paths (override via POLYMARKET_DATA_DIR / POLYMARKET_OUTPUT_DIR for Modal)
+# Paths (override via POLYMARKET_DATA_DIR for Modal)
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT / "analyze" / "signal2")))
+OUTPUT_DIR = DATA_ROOT / "analyze" / "signal2"
 SPIKES_FILE = OUTPUT_DIR / "price_spikes.parquet"
 TRADES_CSV = DATA_ROOT / "ingest" / "trades.csv"
 OUTPUT_FILE = OUTPUT_DIR / "pre_spike_trades.parquet"

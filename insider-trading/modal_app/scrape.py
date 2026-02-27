@@ -46,7 +46,7 @@ def download_historical(output_base: str = ""):
     import os
     import sys
     if output_base:
-        os.environ["POLYMARKET_OUTPUT_DIR"] = output_base
+        os.environ["POLYMARKET_DATA_DIR"] = output_base
     sys.path.insert(0, "/app")
     import historical
     historical.download_historical()
@@ -65,7 +65,7 @@ def fetch_markets(output_base: str = ""):
     import os
     import sys
     if output_base:
-        os.environ["POLYMARKET_OUTPUT_DIR"] = output_base
+        os.environ["POLYMARKET_DATA_DIR"] = output_base
     sys.path.insert(0, "/app")
     import markets
     markets.fetch_markets()
@@ -148,8 +148,8 @@ def scrape_partition_group(
     sys.path.insert(0, "/app")
     from pathlib import Path as _Path
     if output_base:
-        os.environ["POLYMARKET_OUTPUT_DIR"] = output_base
-    scrape_out = _Path(os.environ.get("POLYMARKET_OUTPUT_DIR", VOL_PATH)) / "scrape"
+        os.environ["POLYMARKET_DATA_DIR"] = output_base
+    scrape_out = _Path(os.environ.get("POLYMARKET_DATA_DIR", VOL_PATH)) / "scrape"
     os.makedirs(f"{scrape_out}/cursors", exist_ok=True)
 
     import scraper

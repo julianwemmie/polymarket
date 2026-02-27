@@ -44,13 +44,13 @@ CHUNK_SIZE = 2_000_000            # Rows per chunk when reading trades.csv
 FLUSH_EVERY_N_CHUNKS = 50         # Flush accumulated data to reduce memory
 
 # ---------------------------------------------------------------------------
-# Paths (override via POLYMARKET_DATA_DIR / POLYMARKET_OUTPUT_DIR for Modal)
+# Paths (override via POLYMARKET_DATA_DIR for Modal)
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
 TRADES_CSV = DATA_ROOT / "ingest" / "trades.csv"
-OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT / "analyze" / "signal2")))
+OUTPUT_DIR = DATA_ROOT / "analyze" / "signal2"
 OUTPUT_FILE = OUTPUT_DIR / "price_history.parquet"
 
 # ---------------------------------------------------------------------------

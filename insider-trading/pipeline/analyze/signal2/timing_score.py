@@ -63,12 +63,12 @@ PRE_SPIKE_START_HOURS = 4
 PRE_SPIKE_END_MINUTES = 30
 
 # ---------------------------------------------------------------------------
-# Paths (override via POLYMARKET_DATA_DIR / POLYMARKET_OUTPUT_DIR for Modal)
+# Paths (override via POLYMARKET_DATA_DIR for Modal)
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT / "analyze" / "signal2")))
+OUTPUT_DIR = DATA_ROOT / "analyze" / "signal2"
 PRE_SPIKE_FILE = OUTPUT_DIR / "pre_spike_trades.parquet"
 SPIKES_FILE = OUTPUT_DIR / "price_spikes.parquet"
 PRICE_HISTORY_FILE = OUTPUT_DIR / "price_history.parquet"

@@ -31,8 +31,7 @@ def _run_script(script_path: str, output_base: str):
 
     env = {
         **os.environ,
-        "POLYMARKET_DATA_DIR": VOL_PATH,
-        "POLYMARKET_OUTPUT_DIR": output_base,
+        "POLYMARKET_DATA_DIR": output_base,
         "PYTHONPATH": "/app",
     }
     result = subprocess.run(["python", script_path], env=env)

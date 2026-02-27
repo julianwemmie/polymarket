@@ -32,7 +32,7 @@ import psutil
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT / "analyze" / "signal2")))
+OUTPUT_DIR = DATA_ROOT / "analyze" / "signal2"
 
 CHAIN = [
     ("build_price_history.py",  "price_history.parquet"),

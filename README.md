@@ -28,8 +28,7 @@ insider-trading/
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `POLYMARKET_DATA_DIR` | Base directory for **reading** data | `data/` (local) or `/vol` (Modal) |
-| `POLYMARKET_OUTPUT_DIR` | Base directory for **writing** data | Falls back to `POLYMARKET_DATA_DIR` |
+| `POLYMARKET_DATA_DIR` | Base directory for all data (reads and writes) | `data/` (local) or `/vol` (Modal) |
 
 Each pipeline stage appends its own prefix (`/scrape`, `/ingest`, `/analyze/signal{1,2}`), so a base of `/vol` produces:
 
@@ -38,16 +37,6 @@ Each pipeline stage appends its own prefix (`/scrape`, `/ingest`, `/analyze/sign
 /vol/ingest/          ← orderFilled.csv, trades.csv
 /vol/analyze/signal1/ ← parquet outputs
 /vol/analyze/signal2/ ← parquet outputs
-```
-
-To write outputs to an alternate location (e.g. a dated run), pass `--output-dir`:
-
-```bash
-modal run modal_app/scrape.py --task all --output-dir /vol/runs/2026-02-26
-# writes to /vol/runs/2026-02-26/scrape/
-
-modal run modal_app/ingest.py --output-dir /vol/runs/2026-02-26
-# writes to /vol/runs/2026-02-26/ingest/
 ```
 
 ## Pipeline Overview

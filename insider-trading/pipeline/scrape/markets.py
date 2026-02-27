@@ -19,7 +19,7 @@ import requests
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT))) / "scrape"
+OUTPUT_DIR = DATA_ROOT / "scrape"
 
 OUTPUT_PATH = OUTPUT_DIR / "markets.csv"
 

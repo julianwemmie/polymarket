@@ -18,7 +18,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
 INGEST_DIR = DATA_ROOT / "ingest"
-OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT))) / "ingest"
+OUTPUT_DIR = DATA_ROOT / "ingest"
 
 from pipeline.utils.helpers import get_markets
 

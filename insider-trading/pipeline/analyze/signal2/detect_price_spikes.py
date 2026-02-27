@@ -53,12 +53,12 @@ MIN_TRADES_IN_WINDOW = 2          # Minimum number of trades across the spike wi
                                   # to avoid flagging low-liquidity noise
 
 # ---------------------------------------------------------------------------
-# Paths (override via POLYMARKET_OUTPUT_DIR for Modal)
+# Paths (override via POLYMARKET_DATA_DIR for Modal)
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT / "analyze" / "signal2")))
+OUTPUT_DIR = DATA_ROOT / "analyze" / "signal2"
 INPUT_FILE = OUTPUT_DIR / "price_history.parquet"
 OUTPUT_FILE = OUTPUT_DIR / "price_spikes.parquet"
 

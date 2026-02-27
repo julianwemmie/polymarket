@@ -34,7 +34,7 @@ import psutil
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-OUTPUT_DIR = Path(os.environ.get("POLYMARKET_OUTPUT_DIR", str(DATA_ROOT / "analyze" / "signal1")))
+OUTPUT_DIR = DATA_ROOT / "analyze" / "signal1"
 
 BUILD = SCRIPT_DIR / "build_positions.py"
 BUILD_OUTPUT = OUTPUT_DIR / "wallet_positions.parquet"
