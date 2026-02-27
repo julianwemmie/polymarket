@@ -37,5 +37,8 @@ Thumbs.db
 # Logs
 *.log
 
+# Pipeline data (large, regenerated)
+insider-trading/data/
+
 # Lock files (Python)
 uv.lock
