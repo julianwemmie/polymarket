@@ -1,27 +1,22 @@
 """
 Scan Modal volume for scraped chunks and identify gaps.
 
-Reads chunk files directly on Modal (no download needed), reports:
-  - Which worker chunks exist and their time/row coverage
-  - Which time ranges are missing (gaps)
-  - Duplicate event IDs across chunks (if any)
+Reads chunk files directly on Modal (no download needed), reports
+coverage, gaps, and optionally row counts.
 
 Usage:
-    modal run modal_scan.py                    # quick: filenames only (~5s)
-    modal run modal_scan.py --full             # full: parallel decompress + row counts
-    modal run modal_scan.py --check-dupes      # full + duplicate ID check
+    modal run modal_app/scan.py                    # quick: filenames only (~5s)
+    modal run modal_app/scan.py --full             # full: parallel decompress + row counts
 """
 
 from __future__ import annotations
 
 import modal
 
+from modal_app.common import vol, scan_image, VOL_PATH
+
 app = modal.App("polymarket-scanner")
-vol = modal.Volume.from_name("polymarket-data", create_if_missing=True)
 
-scan_image = modal.Image.debian_slim(python_version="3.12")
-
-VOL_PATH = "/vol"
 SCRAPE_DIR = f"{VOL_PATH}/scrape"
 
 
@@ -42,12 +37,12 @@ def scan_batch(chunk_names: list[str]) -> list[dict]:
     import csv
     import gzip
     import re
+    import time as _time_mod
     from pathlib import Path
 
     pattern = re.compile(
         r"chunk_(\d+)_(\d{8})_(\d{8})_part(\d+)\.csv\.gz"
     )
-    import time as _time_mod
     _t0 = _time_mod.monotonic()
 
     scrape_dir = Path(SCRAPE_DIR)
@@ -97,10 +92,9 @@ def scan_batch(chunk_names: list[str]) -> list[dict]:
             "max_ts": chunk_max_ts,
         })
 
-        # Progress every chunk
         done = len(results)
         total = len(chunk_names)
-        elapsed = __import__('time').monotonic() - _t0
+        elapsed = _time_mod.monotonic() - _t0
         rate = done / elapsed if elapsed > 0 else 0
         remaining = total - done
         eta = int(remaining / rate) if rate > 0 else 0
@@ -199,7 +193,6 @@ def scan_quick() -> dict:
 
     missing_wids = _gap_analysis(all_worker_ids, expected_partitions, ts_str)
 
-    # Also return chunk filenames for potential full scan
     all_names = [cf.name for cf in chunk_files]
 
     return {
@@ -224,8 +217,6 @@ def _gap_analysis(
     ts_str,
 ) -> list[int]:
     """Shared gap analysis logic."""
-    from datetime import datetime, timezone
-
     missing_wids = []
 
     print(f"\n{'=' * 60}")
@@ -285,7 +276,7 @@ def _gap_analysis(
                 est_workers = max(2, int(days * 5))
                 est_containers = max(1, est_workers // 20)
                 print(
-                    f"    modal run modal_scrape.py "
+                    f"    modal run modal_app/scrape.py "
                     f"--start {start} --containers {est_containers} "
                     f"--wpc {min(est_workers, 20)}"
                 )
@@ -299,7 +290,7 @@ def _gap_analysis(
                 print(f"  Missing worker IDs (no manifest): {missing_wids}")
             else:
                 print("  No gaps in worker ID sequence.")
-                print("  (No manifest found — can't verify time ranges)")
+                print("  (No manifest found -- can't verify time ranges)")
 
     return missing_wids
 
@@ -311,18 +302,12 @@ def _gap_analysis(
 
 @app.local_entrypoint()
 def main(full: bool = False):
-    """Scan volume for chunk coverage and gaps.
-
-    Default is quick mode (filenames only). Use --full for row counts.
-    """
+    """Scan volume for chunk coverage and gaps."""
     import time
     from collections import defaultdict
     from datetime import datetime, timezone
 
-    do_full = full
-
-    if not do_full:
-        # Quick mode — single container, no decompression
+    if not full:
         print("Scanning Modal volume (quick mode)...\n")
         result = scan_quick.remote()
 
@@ -338,13 +323,10 @@ def main(full: bool = False):
         print(f"  Missing:       {len(result.get('missing_workers', []))}")
         return
 
-    # ------------------------------------------------------------------
-    # Full mode — fan out across many containers
-    # ------------------------------------------------------------------
+    # Full mode
     print("Scanning Modal volume (full mode)...")
     print("Step 1: Listing chunks...\n")
 
-    # Quick scan first to get chunk list
     quick_result = scan_quick.remote()
     if "error" in quick_result:
         print(f"Error: {quick_result['error']}")
@@ -353,8 +335,6 @@ def main(full: bool = False):
     chunk_names = quick_result["chunk_names"]
     total_chunks = len(chunk_names)
 
-    # Split into batches for parallel containers
-    # ~50 chunks per container, so 1070 chunks -> ~22 containers
     CHUNKS_PER_CONTAINER = 15
     batches = []
     for i in range(0, total_chunks, CHUNKS_PER_CONTAINER):
@@ -366,10 +346,8 @@ def main(full: bool = False):
           f"({CHUNKS_PER_CONTAINER} chunks each)...")
     t0 = time.monotonic()
 
-    # Fan out
     handles = [scan_batch.spawn(batch) for batch in batches]
 
-    # Collect results
     all_chunk_results = []
     for i, h in enumerate(handles):
         batch_results = h.get()
@@ -389,7 +367,6 @@ def main(full: bool = False):
     elapsed = time.monotonic() - t0
     print(f"\nScan complete in {elapsed:.0f}s\n")
 
-    # Aggregate results by worker
     def ts_str(ts):
         if ts == float("inf") or ts == 0 or ts is None:
             return "N/A"
@@ -434,7 +411,6 @@ def main(full: bool = False):
     global_min = min(w["min_ts"] for w in workers_with_data)
     global_max = max(w["max_ts"] for w in workers_with_data)
 
-    # Print per-worker summary
     print(f"{'Worker':>8} {'Rows':>12} {'Size MB':>10} "
           f"{'Min TS':>22} {'Max TS':>22} {'Parts':>6}")
     print("-" * 86)
@@ -459,7 +435,6 @@ def main(full: bool = False):
         f"{sum(w['parts'] for w in workers.values()):>5}"
     )
 
-    # Summary
     print(f"\n{'=' * 60}")
     print("SUMMARY")
     print(f"{'=' * 60}")

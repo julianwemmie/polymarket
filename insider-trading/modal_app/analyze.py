@@ -2,47 +2,37 @@
 Modal cloud runner for Polymarket insider-trading analysis.
 
 Runs Signal 1 (implausibility) and Signal 2 (timing) pipelines on Modal
-with 64 GB RAM, eliminating the memory constraints of local execution.
-
-Setup:
-  pip install modal
-  modal setup
+with 64 GB RAM, eliminating local memory constraints.
 
 Upload data to Modal volume:
-  modal volume create polymarket-data
-  modal volume put polymarket-data \
-      ../data/ingest/trades.csv /ingest/trades.csv
-  modal volume put polymarket-data \
-      ../data/ingest/markets.csv /ingest/markets.csv
+  modal volume put polymarket-data ./data/ingest/trades.csv /ingest/trades.csv
+  modal volume put polymarket-data ./data/ingest/markets.csv /ingest/markets.csv
 
 Run:
-  modal run modal_app.py                # run both signals
-  modal run modal_app.py --signal 1     # signal 1 only
-  modal run modal_app.py --signal 2     # signal 2 only
+  modal run modal_app/analyze.py                # run both signals
+  modal run modal_app/analyze.py --signal 1     # signal 1 only
+  modal run modal_app/analyze.py --signal 2     # signal 2 only
 
 Download results:
-  modal volume get polymarket-data /analyze/signal1/ ../data/analyze/signal1/
-  modal volume get polymarket-data /analyze/signal2/ ../data/analyze/signal2/
+  modal volume get polymarket-data /analyze/signal1/ ./data/analyze/signal1/
+  modal volume get polymarket-data /analyze/signal2/ ./data/analyze/signal2/
 """
 
 import modal
 
+from modal_app.common import vol, analysis_image, VOL_PATH
+
 app = modal.App("polymarket-analysis")
 
-vol = modal.Volume.from_name("polymarket-data", create_if_missing=True)
-
 s1_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("polars>=1.0.0")
-    .add_local_dir("signal1-implausibility", remote_path="/app/signal1")
+    analysis_image
+    .add_local_dir("pipeline/analyze/signal1", remote_path="/app/signal1")
 )
 s2_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("polars>=1.0.0")
-    .add_local_dir("signal2-timing", remote_path="/app/signal2")
+    analysis_image
+    .add_local_dir("pipeline/analyze/signal2", remote_path="/app/signal2")
 )
 
-VOL_PATH = "/vol"
 S1_OUTPUT = f"{VOL_PATH}/analyze/signal1"
 S2_OUTPUT = f"{VOL_PATH}/analyze/signal2"
 
@@ -72,19 +62,19 @@ def _run_script(script_path: str, output_dir: str):
     image=s1_image,
     volumes={VOL_PATH: vol},
     cpu=8,
-    memory=65536,   # 64 GB
-    timeout=7200,   # 2 hours
+    memory=65536,
+    timeout=7200,
 )
 def s1_build_positions():
-    _run_script("/app/signal1/build_wallet_positions.py", S1_OUTPUT)
+    _run_script("/app/signal1/build_positions.py", S1_OUTPUT)
 
 
 @app.function(
     image=s1_image,
     volumes={VOL_PATH: vol},
     cpu=4,
-    memory=16384,   # 16 GB
-    timeout=3600,   # 1 hour
+    memory=16384,
+    timeout=3600,
 )
 def s1_metric(script_name: str):
     _run_script(f"/app/signal1/{script_name}", S1_OUTPUT)
@@ -98,7 +88,7 @@ def s1_metric(script_name: str):
     timeout=3600,
 )
 def s1_aggregate():
-    _run_script("/app/signal1/aggregate_score.py", S1_OUTPUT)
+    _run_script("/app/signal1/aggregate.py", S1_OUTPUT)
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +99,7 @@ def s1_aggregate():
     image=s2_image,
     volumes={VOL_PATH: vol},
     cpu=8,
-    memory=65536,   # 64 GB (build_price_history + pre_spike_wallets are heavy)
+    memory=65536,
     timeout=7200,
 )
 def s2_step(script_name: str):
@@ -171,7 +161,6 @@ def main(signal: str = "all"):
     import threading
 
     if signal == "all":
-        # Run both pipelines concurrently
         t1 = threading.Thread(target=run_signal1)
         t2 = threading.Thread(target=run_signal2)
         t1.start()
