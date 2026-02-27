@@ -9,7 +9,7 @@ Reconstructs per-market price history from the raw trade stream.
 For each market, computes time-weighted average price (TWAP) in fixed time
 buckets -- a simple mean of trade prices within each bucket.
 
-Input:  data/ingest/trades.csv  (151M rows, 33 GB)
+Input:  data/ingest/trades/ (partitioned Parquet)
 Output: output/price_history.parquet
 
 Columns produced:
@@ -20,9 +20,8 @@ Columns produced:
   - num_trades (u32)      number of trades in this bucket
   - total_volume (f64)    total USD volume in this bucket
 
-Memory: Processes trades.csv in chunks via polars read_csv_batched.
-        Accumulates bucket aggregates incrementally in a dict, then
-        flushes to parquet at the end.
+Memory: Processes trades in part-file batches. Accumulates bucket aggregates
+        incrementally, then flushes to parquet at the end.
 
 Usage:
   cd pipeline/analyze/signal2
@@ -40,7 +39,6 @@ import polars as pl
 # Tunable parameters
 # ---------------------------------------------------------------------------
 PRICE_BUCKET_MINUTES = 5          # Granularity of price history buckets
-CHUNK_SIZE = 2_000_000            # Rows per chunk when reading trades.csv
 FLUSH_EVERY_N_CHUNKS = 50         # Flush accumulated data to reduce memory
 
 # ---------------------------------------------------------------------------
@@ -49,7 +47,7 @@ FLUSH_EVERY_N_CHUNKS = 50         # Flush accumulated data to reduce memory
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-TRADES_CSV = DATA_ROOT / "ingest" / "trades.csv"
+TRADES_DIR = DATA_ROOT / "ingest" / "trades"
 OUTPUT_DIR = DATA_ROOT / "analyze" / "signal2"
 OUTPUT_FILE = OUTPUT_DIR / "price_history.parquet"
 
@@ -88,61 +86,37 @@ def process_chunk(df: pl.DataFrame, bucket_minutes: int) -> pl.DataFrame:
 
 def main() -> None:
     print(f"[build_price_history] Starting...")
-    print(f"  Trades CSV : {TRADES_CSV}")
+    print(f"  Trades dir : {TRADES_DIR}")
     print(f"  Output     : {OUTPUT_FILE}")
     print(f"  Bucket size: {PRICE_BUCKET_MINUTES} minutes")
-    print(f"  Chunk size : {CHUNK_SIZE:,} rows")
     print()
 
-    if not TRADES_CSV.exists():
-        raise FileNotFoundError(f"Trades CSV not found: {TRADES_CSV}")
+    if not TRADES_DIR.exists():
+        raise FileNotFoundError(f"Trades directory not found: {TRADES_DIR}")
+
+    part_files = sorted(TRADES_DIR.glob("*.parquet"))
+    if not part_files:
+        raise FileNotFoundError(f"No Parquet files found in {TRADES_DIR}")
+
+    print(f"  Part files : {len(part_files)}")
 
     t0 = time.time()
 
-    # We'll read in batches and accumulate partial aggregates.
+    # We'll read part-files and accumulate partial aggregates.
     # Each partial aggregate has (market_id, bucket_start) -> (price_sum, total_volume, num_trades)
     # We periodically combine partials to keep memory bounded.
-
-    reader = pl.read_csv_batched(
-        TRADES_CSV,
-        batch_size=CHUNK_SIZE,
-        schema_overrides={
-            "timestamp": pl.String,
-            "market_id": pl.Int64,
-            "price": pl.Float64,
-            "usd_amount": pl.Float64,
-        },
-        columns=["timestamp", "market_id", "price", "usd_amount"],
-    )
 
     accumulated: list[pl.DataFrame] = []
     total_rows = 0
     chunk_count = 0
 
-    while True:
-        batches = reader.next_batches(1)
-        if batches is None or len(batches) == 0:
-            break
-
-        chunk = batches[0]
+    for part_file in part_files:
+        chunk = pl.read_parquet(
+            part_file,
+            columns=["timestamp", "market_id", "price", "usd_amount"],
+        )
         chunk_count += 1
         total_rows += len(chunk)
-
-        # Parse timestamp string to datetime -- handle both with and without
-        # fractional seconds by trying the fractional format first, then
-        # falling back to the non-fractional format for any failures.
-        chunk = chunk.with_columns(
-            pl.col("timestamp").str.to_datetime(
-                "%Y-%m-%dT%H:%M:%S%.f", strict=False
-            ).alias("timestamp_parsed"),
-        )
-        # For rows where fractional-seconds parse failed, try without fractional
-        chunk = chunk.with_columns(
-            pl.when(pl.col("timestamp_parsed").is_null())
-            .then(pl.col("timestamp").str.to_datetime("%Y-%m-%dT%H:%M:%S", strict=False))
-            .otherwise(pl.col("timestamp_parsed"))
-            .alias("timestamp"),
-        ).drop("timestamp_parsed")
 
         # Drop rows where price or usd_amount is null or zero (no contribution to avg)
         chunk = chunk.filter(
@@ -155,9 +129,8 @@ def main() -> None:
         partial = process_chunk(chunk, PRICE_BUCKET_MINUTES)
         accumulated.append(partial)
 
-        if chunk_count % 10 == 0:
-            elapsed = time.time() - t0
-            print(f"  Processed {chunk_count} chunks ({total_rows:,} rows) in {elapsed:.1f}s")
+        elapsed = time.time() - t0
+        print(f"  [{chunk_count}/{len(part_files)}] {total_rows:,} rows | {elapsed:.1f}s")
 
         # Periodically combine accumulated partials to limit memory usage
         if chunk_count % FLUSH_EVERY_N_CHUNKS == 0:

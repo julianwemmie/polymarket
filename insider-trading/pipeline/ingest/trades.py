@@ -5,7 +5,7 @@ Reads directly from scrape sources:
     data/scrape/chunk_*.csv.gz      — gap scraper output (gzipped)
 
 Joins with market metadata, computes price/direction/amounts,
-and writes to data/ingest/trades.csv.
+and writes to data/ingest/trades/ as partitioned Parquet files.
 
 Usage:
     uv run python -m pipeline.ingest.trades
@@ -14,7 +14,9 @@ Usage:
 import glob
 import os
 import re
+import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 
@@ -66,33 +68,59 @@ def _sorted_chunks() -> list[Path]:
     return [p for _, _, p in chunks]
 
 
+PARALLEL_READS = 8  # concurrent gzip decompression threads
+
+
+def _read_chunk(path: Path) -> pl.DataFrame | None:
+    """Read a single gzipped chunk file. Runs in a thread pool."""
+    df = pl.read_csv(path, schema_overrides=CSV_SCHEMA)
+    return df if len(df) > 0 else None
+
+
 def _iter_batches(chunk_size: int):
     """Yield (source_name, DataFrame) from all scrape sources.
 
     Historical file is streamed in batches (can be very large).
-    Chunk files are read whole (bounded by scraper part size).
+    Chunk files are read in parallel and accumulated into ~chunk_size
+    row batches before yielding, to avoid per-file overhead on thousands
+    of small files.
     """
     if HISTORICAL_PATH.exists():
-        reader = pl.read_csv_batched(
+        reader = pl.scan_csv(
             str(HISTORICAL_PATH),
-            batch_size=chunk_size,
             schema_overrides=CSV_SCHEMA,
-        )
-        batch_num = 0
-        while True:
-            batches = reader.next_batches(1)
-            if not batches:
-                break
-            batch_num += 1
-            yield (f"historical (batch {batch_num})", batches[0])
+        ).collect_batches(chunk_size=chunk_size)
+        for batch_num, batch in enumerate(reader, 1):
+            yield (f"historical (batch {batch_num})", batch)
 
-    for chunk_path in _sorted_chunks():
-        df = pl.read_csv(
-            chunk_path,
-            schema_overrides=CSV_SCHEMA,
-        )
-        if len(df) > 0:
-            yield (chunk_path.name, df)
+    # Read chunk files in parallel and accumulate into larger batches.
+    chunk_files = _sorted_chunks()
+    if not chunk_files:
+        return
+
+    buffer: list[pl.DataFrame] = []
+    buffer_rows = 0
+    chunks_in_buffer = 0
+
+    with ThreadPoolExecutor(max_workers=PARALLEL_READS) as pool:
+        # Submit reads in groups to overlap I/O with processing
+        for i in range(0, len(chunk_files), PARALLEL_READS):
+            group = chunk_files[i : i + PARALLEL_READS]
+            results = list(pool.map(_read_chunk, group))
+            for df in results:
+                if df is not None:
+                    buffer.append(df)
+                    buffer_rows += len(df)
+                    chunks_in_buffer += 1
+
+                    if buffer_rows >= chunk_size:
+                        yield (f"chunks ({chunks_in_buffer} files, {buffer_rows:,} rows)", pl.concat(buffer))
+                        buffer = []
+                        buffer_rows = 0
+                        chunks_in_buffer = 0
+
+    if buffer:
+        yield (f"chunks ({chunks_in_buffer} files, {buffer_rows:,} rows)", pl.concat(buffer))
 
 
 def build_token_lookup():
@@ -185,23 +213,22 @@ def process_chunk(df, markets_long):
 
 
 def process_trades(
-    output_file: str = None,
+    output_dir: str = None,
     chunk_size: int = 5_000_000,
 ):
     """Process raw OrderFilled events into structured trades.
 
     Reads directly from scrape sources (historical + chunks),
-    processes in memory-bounded batches.
+    processes in memory-bounded batches, writes partitioned Parquet.
 
     Args:
-        output_file: Path to write processed trades CSV
+        output_dir: Directory to write Parquet part-files into
         chunk_size: Number of rows per batch for historical file (default 5M)
     """
-    if output_file is None:
-        output_file = str(OUTPUT_DIR / "trades.csv")
+    if output_dir is None:
+        output_dir = str(OUTPUT_DIR / "trades")
 
-    output = Path(output_file)
-    output.parent.mkdir(parents=True, exist_ok=True)
+    output = Path(output_dir)
 
     has_historical = HISTORICAL_PATH.exists()
     chunk_files = _sorted_chunks()
@@ -217,13 +244,14 @@ def process_trades(
         print("\nError: No source data found. Run scraping first.")
         return
 
-    # Rough row estimate for progress (historical ~200 B/row, gzip ~50 B/row)
-    est_rows = 0
+    # Estimate batch count for progress (historical batches + chunk batches)
+    est_hist_batches = 0
     if has_historical:
-        est_rows += HISTORICAL_PATH.stat().st_size // 200
-    for cf in chunk_files:
-        est_rows += cf.stat().st_size // 50
-    print(f"  Estimated:  ~{est_rows:,} rows")
+        est_hist_batches = max(HISTORICAL_PATH.stat().st_size // 200 // chunk_size, 1)
+    # Chunk files get combined into ~chunk_size row batches
+    est_chunk_rows = sum(cf.stat().st_size // 100 for cf in chunk_files)
+    est_chunk_batches = max(est_chunk_rows // chunk_size, 1) if chunk_files else 0
+    est_total_batches = est_hist_batches + est_chunk_batches
 
     print("\nBuilding token lookup from markets.csv...")
     markets_long = build_token_lookup()
@@ -231,7 +259,8 @@ def process_trades(
 
     # Remove existing output to start fresh
     if output.exists():
-        output.unlink()
+        shutil.rmtree(output)
+    output.mkdir(parents=True, exist_ok=True)
 
     total_processed = 0
     batch_num = 0
@@ -242,32 +271,29 @@ def process_trades(
         batch_num += 1
         processed = process_chunk(df, markets_long)
 
-        # Write: header only for first batch
-        if batch_num == 1:
-            processed.write_csv(output_file)
-        else:
-            with open(output_file, mode="a") as f:
-                processed.write_csv(f, include_header=False)
+        # Write each batch as a Parquet part-file
+        processed.write_parquet(output / f"part_{batch_num:04d}.parquet")
 
         total_processed += len(processed)
         elapsed = time.time() - t0
         rate = total_processed / elapsed if elapsed > 0 else 0
-        pct = min(total_processed / est_rows * 100, 99.9) if est_rows > 0 else 0
-        remaining = max(est_rows - total_processed, 0)
-        eta = remaining / rate if rate > 0 else 0
+        batch_rate = batch_num / elapsed if elapsed > 0 else 0
+        remaining_batches = max(est_total_batches - batch_num, 0)
+        eta = remaining_batches / batch_rate if batch_rate > 0 else 0
         eta_m, eta_s = divmod(int(eta), 60)
+        pct = min(batch_num / est_total_batches * 100, 99.9) if est_total_batches > 0 else 0
 
         print(
-            f"  [batch {batch_num}] {pct:.0f}% | "
+            f"  [{batch_num}/{est_total_batches}] {pct:.0f}% | "
             f"{source_name}: {len(processed):,} rows | "
             f"Total: {total_processed:,} | {rate:,.0f} rows/s | "
             f"ETA {eta_m}m {eta_s:02d}s"
         )
 
     elapsed = time.time() - t0
-    file_size = output.stat().st_size
+    total_size = sum(f.stat().st_size for f in output.glob("*.parquet"))
     print(f"\nDone! {total_processed:,} trades in {elapsed:.1f}s")
-    print(f"  Output: {output} ({file_size / (1024**3):.2f} GB)")
+    print(f"  Output: {output}/ ({batch_num} part-files, {total_size / (1024**3):.2f} GB)")
     print("=" * 60)
 
 

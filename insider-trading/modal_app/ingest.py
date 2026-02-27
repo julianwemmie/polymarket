@@ -12,7 +12,7 @@ Run:
     modal run modal_app/ingest.py --output-dir /vol/run1   # custom base
 
 Download results:
-    modal volume get polymarket-data /ingest/trades.csv ./data/ingest/trades.csv
+    modal volume get polymarket-data /ingest/trades/ ./data/ingest/trades/
 """
 
 from typing import Optional
@@ -74,4 +74,4 @@ def main(output_dir: Optional[str] = None):
     print(f"INGEST COMPLETE ({elapsed:.0f}s)")
     print(f"{'=' * 60}")
     print(f"\nDownload:")
-    print(f"  modal volume get polymarket-data {out.removeprefix(VOL_PATH)}/ingest/trades.csv ./data/ingest/trades.csv")
+    print(f"  modal volume get polymarket-data {out.removeprefix(VOL_PATH)}/ingest/trades/ ./data/ingest/trades/")

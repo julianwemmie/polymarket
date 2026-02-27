@@ -19,7 +19,7 @@ ROI per position = (net_tokens * 1.0 * position_won + total_usd_out - total_usd_
 NOTE: trading_span is computed from resolved bets only (first_trade_timestamp
 to last_trade_timestamp in wallet_positions). This may understate the actual
 trading period if the wallet has unresolved trades. A more accurate span
-would require reading from the raw trades.csv, which is not done here for
+would require reading from the raw trades, which is not done here for
 performance reasons.
 
 Flag: ROI > 200% with $500+ deployed and 5+ resolved bets.

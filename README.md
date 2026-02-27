@@ -18,7 +18,7 @@ insider-trading/
 ├── dashboard/              # Streamlit visualization
 ├── data/                   # shared artifacts (gitignored)
 │   ├── scrape/             #   historical.csv, chunks, markets.csv
-│   ├── ingest/             #   trades.csv
+│   ├── ingest/             #   trades/ (partitioned parquet)
 │   └── analyze/            #   parquet outputs
 │       ├── signal1/
 │       └── signal2/
@@ -35,7 +35,7 @@ Each pipeline stage appends its own prefix (`/scrape`, `/ingest`, `/analyze/sign
 
 ```
 /vol/scrape/          ← historical.csv, chunk_*.csv.gz, markets.csv
-/vol/ingest/          ← trades.csv
+/vol/ingest/          ← trades/ (partitioned parquet)
 /vol/analyze/signal1/ ← parquet outputs
 /vol/analyze/signal2/ ← parquet outputs
 ```

@@ -5,10 +5,10 @@
 """
 Step 0: Build per-wallet, per-market position summary from raw trades.
 
-Reads the 33 GB trades.csv in batches (polars read_csv_batched) and aggregates
-into per-(wallet, market_id, side) positions with volume-weighted avg entry price,
-total USD in (buys), total USD out (sells), net tokens, trade count, and
-first/last trade timestamps.
+Reads partitioned Parquet trade files and aggregates into per-(wallet,
+market_id, side) positions with volume-weighted avg entry price, total USD
+in (buys), total USD out (sells), net tokens, trade count, and first/last
+trade timestamps.
 
 Then joins with markets.csv to add market metadata and derives resolution outcome
 from final trade prices (markets that closed have final prices near 0 or 1).
@@ -29,12 +29,10 @@ import time
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-TRADES_PATH = DATA_ROOT / "ingest" / "trades.csv"
+TRADES_DIR = DATA_ROOT / "ingest" / "trades"
 MARKETS_PATH = DATA_ROOT / "scrape" / "markets.csv"
 OUTPUT_DIR = DATA_ROOT / "analyze" / "signal1"
 OUTPUT_PATH = OUTPUT_DIR / "wallet_positions.parquet"
-
-BATCH_SIZE = 2_000_000
 
 
 def process_batch(df: pl.DataFrame) -> pl.DataFrame:
@@ -157,43 +155,29 @@ def derive_resolution(markets: pl.DataFrame, last_prices: pl.DataFrame) -> pl.Da
 
 def main():
     print("=" * 60)
-    print("Building wallet positions from trades.csv")
+    print("Building wallet positions from trades")
     print("=" * 60)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    trades_path = TRADES_PATH.resolve()
+    trades_dir = TRADES_DIR.resolve()
     markets_path = MARKETS_PATH.resolve()
 
-    print(f"Trades file: {trades_path}")
+    print(f"Trades dir:  {trades_dir}")
     print(f"Markets file: {markets_path}")
 
-    if not trades_path.exists():
-        raise FileNotFoundError(f"Trades file not found: {trades_path}")
+    if not trades_dir.exists():
+        raise FileNotFoundError(f"Trades directory not found: {trades_dir}")
     if not markets_path.exists():
         raise FileNotFoundError(f"Markets file not found: {markets_path}")
 
-    # ---- Phase 1: Process trades in batches ----
-    print(f"\nPhase 1: Reading trades in batches of {BATCH_SIZE:,} rows...")
-    start = time.time()
+    part_files = sorted(trades_dir.glob("*.parquet"))
+    if not part_files:
+        raise FileNotFoundError(f"No Parquet files found in {trades_dir}")
 
-    reader = pl.read_csv_batched(
-        trades_path,
-        schema_overrides={
-            "timestamp": pl.Utf8,
-            "market_id": pl.Utf8,
-            "maker": pl.Utf8,
-            "taker": pl.Utf8,
-            "nonusdc_side": pl.Utf8,
-            "maker_direction": pl.Utf8,
-            "taker_direction": pl.Utf8,
-            "price": pl.Float64,
-            "usd_amount": pl.Float64,
-            "token_amount": pl.Float64,
-            "transactionHash": pl.Utf8,
-        },
-        batch_size=BATCH_SIZE,
-    )
+    # ---- Phase 1: Process trades in batches ----
+    print(f"\nPhase 1: Reading {len(part_files)} Parquet part-files...")
+    start = time.time()
 
     partial_aggs = []
     # Also collect last trade price per (market_id, side=token1) for resolution derivation
@@ -201,14 +185,11 @@ def main():
     total_rows = 0
     batch_num = 0
 
-    while True:
-        batches = reader.next_batches(1)
-        if batches is None or len(batches) == 0:
-            break
-        batch = batches[0]
+    for part_file in part_files:
+        batch = pl.read_parquet(part_file)
         batch_num += 1
         total_rows += len(batch)
-        print(f"  Batch {batch_num}: {total_rows:,} rows processed", flush=True)
+        print(f"  [{batch_num}/{len(part_files)}] {total_rows:,} rows processed", flush=True)
 
         # Get partial aggregation for this batch
         agg = process_batch(batch)
