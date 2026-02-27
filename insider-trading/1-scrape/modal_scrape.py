@@ -15,6 +15,8 @@ Usage:
     modal run modal_scrape.py --containers 10                    # 10 x 20 = 200 total
     modal run modal_scrape.py --containers 3 --wpc 10            # 3 x 10 = 30 total
     modal run modal_scrape.py --start 7d                         # scrape last 7 days
+    modal run modal_scrape.py --start 2026-02-23 --end 2026-02-26  # exact date range
+    modal run modal_scrape.py --start 2026-02-23T09:08:04          # ISO datetime start
     modal run modal_scrape.py --max-batches 5                    # test mode: 5 batches per worker
 
 Download results:
@@ -313,11 +315,45 @@ def verify_partitions(
 # ---------------------------------------------------------------------------
 
 
+def _parse_ts(value: str) -> int:
+    """Parse a timestamp string into a unix timestamp.
+
+    Accepts:
+        - Relative durations: '7d', '24h'
+        - ISO-8601 datetime: '2026-02-23T09:08:04'
+        - Date only: '2026-02-23'
+        - Raw unix timestamp: '1759855190'
+    """
+    from datetime import datetime, timezone
+
+    s = value.strip()
+    now = int(datetime.now(tz=timezone.utc).timestamp())
+
+    # Relative durations
+    sl = s.lower()
+    if sl.endswith("d"):
+        return now - int(sl[:-1]) * 86400
+    if sl.endswith("h"):
+        return now - int(sl[:-1]) * 3600
+
+    # ISO-8601 datetime (with or without seconds)
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+
+    # Raw unix timestamp
+    return int(s)
+
+
 @app.local_entrypoint()
 def main(
     containers: int = 5,
     wpc: int = 20,
     start: Optional[str] = None,
+    end: Optional[str] = None,
     max_batches: Optional[int] = None,
 ):
     """Orchestrate multi-machine scraping.
@@ -325,7 +361,8 @@ def main(
     Args:
         containers: Number of Modal containers to run in parallel.
         wpc: Workers per container (async workers within each container).
-        start: Start timestamp — unix ts or relative like '7d', '24h'.
+        start: Start timestamp — unix ts, relative ('7d', '24h'), ISO date/datetime.
+        end: End timestamp — same formats as start. Defaults to now.
         max_batches: Stop each worker after N batches (for testing).
     """
     import math
@@ -337,16 +374,13 @@ def main(
     # Parse start timestamp
     gap_start_ts = DEFAULT_GAP_START_TS
     if start is not None:
-        s = start.strip().lower()
-        now = int(datetime.now(tz=timezone.utc).timestamp())
-        if s.endswith("d"):
-            gap_start_ts = now - int(s[:-1]) * 86400
-        elif s.endswith("h"):
-            gap_start_ts = now - int(s[:-1]) * 3600
-        else:
-            gap_start_ts = int(s)
+        gap_start_ts = _parse_ts(start)
 
-    gap_end_ts = int(datetime.now(tz=timezone.utc).timestamp())
+    # Parse end timestamp
+    if end is not None:
+        gap_end_ts = _parse_ts(end)
+    else:
+        gap_end_ts = int(datetime.now(tz=timezone.utc).timestamp())
 
     gap_start_str = datetime.fromtimestamp(
         gap_start_ts, tz=timezone.utc
