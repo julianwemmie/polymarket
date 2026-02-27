@@ -4,7 +4,6 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import List, Dict
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent

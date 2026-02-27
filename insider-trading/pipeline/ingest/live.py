@@ -12,7 +12,7 @@ DATA_DIR = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data" 
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import polars as pl
-from pipeline.utils.helpers import get_markets, update_missing_tokens
+from pipeline.utils.helpers import get_markets
 
 import subprocess
 import pandas as pd

@@ -10,7 +10,6 @@ BASE = Path(__file__).resolve().parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(BASE / "data")))
 SIGNAL1 = DATA_ROOT / "analyze" / "signal1"
 SIGNAL2 = DATA_ROOT / "analyze" / "signal2"
-MARKETS_CSV = DATA_ROOT / "ingest" / "markets.csv"
 
 
 def get_conn() -> duckdb.DuckDBPyConnection:
