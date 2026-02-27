@@ -237,7 +237,11 @@ def main() -> None:
     markets_with_spikes = 0
     markets_processed = 0
 
-    for market_df in price_history.partition_by("market_id", maintain_order=True):
+    market_partitions = price_history.partition_by("market_id", maintain_order=True)
+    total_markets = len(market_partitions)
+    log_interval = max(1, total_markets // 20)  # ~5% increments
+
+    for market_df in market_partitions:
         spikes_df = detect_spikes_for_market(market_df)
         markets_processed += 1
 
@@ -245,11 +249,15 @@ def main() -> None:
             all_spikes.append(spikes_df)
             markets_with_spikes += 1
 
-        if markets_processed % 5000 == 0:
+        if markets_processed % log_interval == 0 or markets_processed == total_markets:
             elapsed = time.time() - t0
+            pct = markets_processed / total_markets * 100
+            rate = markets_processed / elapsed if elapsed > 0 else 0
+            remaining = (total_markets - markets_processed) / rate if rate > 0 else 0
             spike_count = sum(len(s) for s in all_spikes)
-            print(f"  Processed {markets_processed:,} markets "
-                  f"({spike_count:,} spikes found) in {elapsed:.1f}s")
+            print(f"  [{markets_processed:,}/{total_markets:,}] {pct:.0f}% | "
+                  f"{spike_count:,} spikes | {rate:.0f} markets/s | ETA {remaining:.0f}s",
+                  flush=True)
 
     # Combine all spikes
     if not all_spikes:

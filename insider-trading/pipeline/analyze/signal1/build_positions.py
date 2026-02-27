@@ -131,10 +131,12 @@ def derive_resolution(markets: pl.DataFrame, last_prices: pl.DataFrame) -> pl.Da
     - If last price <= 0.15 -> token2 won (resolution = "token2")
     - Otherwise -> ambiguous / unresolved
     """
-    # Join last prices onto markets
-    markets_with_prices = markets.join(
-        last_prices, left_on="id", right_on="market_id", how="left"
-    )
+    # Join last prices onto markets (markets.id is str from CSV, market_id is i64 from trades)
+    markets_with_prices = markets.with_columns(
+        pl.col("id").cast(pl.Int64).alias("_join_id")
+    ).join(
+        last_prices, left_on="_join_id", right_on="market_id", how="left"
+    ).drop("_join_id")
 
     # Derive resolution
     markets_with_resolution = markets_with_prices.with_columns(
@@ -293,7 +295,7 @@ def main():
 
     # Select relevant market columns for join
     market_info = markets_resolved.select(
-        pl.col("id").alias("market_id"),
+        pl.col("id").cast(pl.Int64).alias("market_id"),
         pl.col("volume").alias("market_volume"),
         pl.col("closedTime").alias("closed_time"),
         pl.col("resolution"),
