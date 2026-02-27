@@ -18,6 +18,8 @@ Download results:
   modal volume get polymarket-data /analyze/signal2/ ./data/analyze/signal2/
 """
 
+from typing import Optional
+
 import modal
 
 from modal_app.common import vol, analysis_image, VOL_PATH
@@ -33,11 +35,11 @@ s2_image = (
     .add_local_dir("pipeline/analyze/signal2", remote_path="/app/signal2")
 )
 
-S1_OUTPUT = f"{VOL_PATH}/analyze/signal1"
-S2_OUTPUT = f"{VOL_PATH}/analyze/signal2"
+def _output_dirs(base: str = VOL_PATH):
+    return f"{base}/analyze/signal1", f"{base}/analyze/signal2"
 
 
-def _run_script(script_path: str, output_dir: str):
+def _run_script(script_path: str, output_dir: str, data_dir: str = VOL_PATH):
     """Run an analysis script with volume-mounted paths."""
     import subprocess
     import os
@@ -45,7 +47,7 @@ def _run_script(script_path: str, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
     env = {
         **os.environ,
-        "POLYMARKET_DATA_DIR": VOL_PATH,
+        "POLYMARKET_DATA_DIR": data_dir,
     }
     result = subprocess.run(["python", script_path], env=env)
     if result.returncode != 0:
@@ -64,8 +66,9 @@ def _run_script(script_path: str, output_dir: str):
     memory=65536,
     timeout=7200,
 )
-def s1_build_positions():
-    _run_script("/app/signal1/build_positions.py", S1_OUTPUT)
+def s1_build_positions(output_base: str = VOL_PATH):
+    s1_out, _ = _output_dirs(output_base)
+    _run_script("/app/signal1/build_positions.py", s1_out, data_dir=output_base)
 
 
 @app.function(
@@ -75,8 +78,9 @@ def s1_build_positions():
     memory=16384,
     timeout=3600,
 )
-def s1_metric(script_name: str):
-    _run_script(f"/app/signal1/{script_name}", S1_OUTPUT)
+def s1_metric(script_name: str, output_base: str = VOL_PATH):
+    s1_out, _ = _output_dirs(output_base)
+    _run_script(f"/app/signal1/{script_name}", s1_out, data_dir=output_base)
 
 
 @app.function(
@@ -86,8 +90,9 @@ def s1_metric(script_name: str):
     memory=16384,
     timeout=3600,
 )
-def s1_aggregate():
-    _run_script("/app/signal1/aggregate.py", S1_OUTPUT)
+def s1_aggregate(output_base: str = VOL_PATH):
+    s1_out, _ = _output_dirs(output_base)
+    _run_script("/app/signal1/aggregate.py", s1_out, data_dir=output_base)
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +106,9 @@ def s1_aggregate():
     memory=65536,
     timeout=7200,
 )
-def s2_step(script_name: str):
-    _run_script(f"/app/signal2/{script_name}", S2_OUTPUT)
+def s2_step(script_name: str, output_base: str = VOL_PATH):
+    _, s2_out = _output_dirs(output_base)
+    _run_script(f"/app/signal2/{script_name}", s2_out, data_dir=output_base)
 
 
 # ---------------------------------------------------------------------------
@@ -128,48 +134,52 @@ SIGNAL2_CHAIN = [
 ]
 
 
-def run_signal1():
+def run_signal1(output_base: str = VOL_PATH):
     print("=== Signal 1: Implausibility ===")
 
     print("Step 1/3: Building wallet positions...")
-    s1_build_positions.remote()
+    s1_build_positions.remote(output_base=output_base)
 
     print(f"Step 2/3: Running {len(SIGNAL1_METRICS)} metrics in parallel...")
-    handles = [s1_metric.spawn(m) for m in SIGNAL1_METRICS]
+    handles = [s1_metric.spawn(m, output_base=output_base) for m in SIGNAL1_METRICS]
     for h in handles:
         h.get()
 
     print("Step 3/3: Aggregating scores...")
-    s1_aggregate.remote()
+    s1_aggregate.remote(output_base=output_base)
 
     print("Signal 1 complete!")
 
 
-def run_signal2():
+def run_signal2(output_base: str = VOL_PATH):
     print("=== Signal 2: Timing ===")
 
     for i, script in enumerate(SIGNAL2_CHAIN, 1):
         print(f"Step {i}/{len(SIGNAL2_CHAIN)}: {script}...")
-        s2_step.remote(script)
+        s2_step.remote(script, output_base=output_base)
 
     print("Signal 2 complete!")
 
 
 @app.local_entrypoint()
-def main(signal: str = "all"):
+def main(signal: str = "all", output_dir: Optional[str] = None):
     import threading
 
+    out = output_dir or VOL_PATH
+
+    print(f"  Output base: {out}")
+
     if signal == "all":
-        t1 = threading.Thread(target=run_signal1)
-        t2 = threading.Thread(target=run_signal2)
+        t1 = threading.Thread(target=run_signal1, args=(out,))
+        t2 = threading.Thread(target=run_signal2, args=(out,))
         t1.start()
         t2.start()
         t1.join()
         t2.join()
     elif signal == "1":
-        run_signal1()
+        run_signal1(output_base=out)
     elif signal == "2":
-        run_signal2()
+        run_signal2(output_base=out)
     else:
         raise ValueError(f"Unknown signal: {signal}. Use 'all', '1', or '2'.")
 
