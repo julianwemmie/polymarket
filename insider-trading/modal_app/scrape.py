@@ -202,24 +202,25 @@ def scrape_partition_group(
             )
 
             elapsed = time.monotonic() - scraper.progress.start_time
+            est = scraper.progress.estimated_total
             pct = (
-                (total_rows / estimated_container * 100)
-                if estimated_container > 0
+                (total_rows / est * 100)
+                if est > 0
                 else 0
             )
 
-            if total_rate > 0 and estimated_container > total_rows:
-                eta_secs = (estimated_container - total_rows) / total_rate
+            if total_rate > 0 and est > total_rows:
+                eta_secs = (est - total_rows) / total_rate
                 eta_m = int(eta_secs // 60)
                 eta_s = int(eta_secs % 60)
                 eta_str = f"{eta_m}m {eta_s:02d}s"
-            elif done == len(assignments):
+            elif active == 0 and done > 0:
                 eta_str = "done"
             else:
                 eta_str = "..."
 
             print(
-                f"  PROGRESS: {total_rows:,}/{estimated_container:,} "
+                f"  PROGRESS: {total_rows:,}/{est:,} "
                 f"({pct:.1f}%) | {total_rate:,.0f} rows/s | "
                 f"{active} active, {done} done | "
                 f"ETA {eta_str}",
@@ -233,36 +234,116 @@ def scrape_partition_group(
         stop_event = asyncio.Event()
         reporter = asyncio.create_task(_progress_reporter(stop_event))
 
+        # Minimum remaining time range (seconds) worth stealing
+        MIN_STEAL_SECS = 300  # 5 minutes
+
+        next_wid = max(a["worker_id"] for a in assignments) + 1
+        bounds_map = {}   # worker_id -> WorkerBounds
+        pending = {}      # asyncio.Task -> worker_id
+        all_results = []
+
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                tasks = [
-                    scraper.worker(
-                        session,
-                        a["worker_id"],
-                        a["start_ts"],
-                        a["end_ts"],
-                        resume=False,
-                        semaphore=sem,
-                        max_batches=max_batches,
+                # Launch initial workers with mutable bounds
+                for a in assignments:
+                    wid = a["worker_id"]
+                    b = scraper.WorkerBounds(
+                        end_ts=a["end_ts"],
+                        original_end_ts=a["end_ts"],
                     )
-                    for a in assignments
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                    bounds_map[wid] = b
+                    task = asyncio.create_task(
+                        scraper.worker(
+                            session, wid, a["start_ts"], a["end_ts"],
+                            resume=False, semaphore=sem,
+                            max_batches=max_batches, bounds=b,
+                        )
+                    )
+                    pending[task] = wid
+
+                # Work-stealing loop
+                while pending:
+                    done, _ = await asyncio.wait(
+                        pending.keys(),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    for task in done:
+                        wid = pending.pop(task)
+                        try:
+                            result = task.result()
+                            all_results.append(result)
+                        except Exception as exc:
+                            all_results.append({
+                                "worker_id": wid,
+                                "status": "failed",
+                                "error": str(exc),
+                            })
+
+                        if not pending:
+                            break
+
+                        # Find active worker with the largest remaining range
+                        best_victim = None
+                        best_remaining = 0
+                        for _, active_wid in pending.items():
+                            ws = scraper.progress.workers.get(active_wid)
+                            if ws is None or ws.status != "active":
+                                continue
+                            if ws.current_ts <= 0:
+                                continue  # hasn't produced data yet
+                            b = bounds_map[active_wid]
+                            remaining = b.end_ts - ws.current_ts
+                            if remaining > best_remaining:
+                                best_remaining = remaining
+                                best_victim = active_wid
+
+                        if best_victim is None or best_remaining <= MIN_STEAL_SECS:
+                            continue
+
+                        # Split: take the back half of the victim's remaining range
+                        victim_bounds = bounds_map[best_victim]
+                        victim_ws = scraper.progress.workers[best_victim]
+                        midpoint = victim_ws.current_ts + (best_remaining // 2)
+                        old_end = victim_bounds.end_ts
+
+                        # Shrink victim's range
+                        victim_bounds.end_ts = midpoint
+
+                        # Spawn a new worker for the stolen range
+                        steal_wid = next_wid
+                        next_wid += 1
+                        steal_bounds = scraper.WorkerBounds(
+                            end_ts=old_end,
+                            original_end_ts=old_end,
+                        )
+                        bounds_map[steal_wid] = steal_bounds
+                        scraper.progress.num_workers += 1
+                        scraper.progress.estimated_total += estimated_per_worker
+
+                        print(
+                            f"  STEAL: W{steal_wid} taking "
+                            f"[{scraper.ts_to_str(midpoint)} -> "
+                            f"{scraper.ts_to_str(old_end)}] "
+                            f"from W{best_victim:02d} "
+                            f"({best_remaining // 60}m remaining)",
+                            flush=True,
+                        )
+
+                        steal_task = asyncio.create_task(
+                            scraper.worker(
+                                session, steal_wid, midpoint, old_end,
+                                resume=False, semaphore=sem,
+                                max_batches=max_batches, bounds=steal_bounds,
+                            )
+                        )
+                        pending[steal_task] = steal_wid
+
         finally:
             stop_event.set()
             await reporter
 
-        outputs = []
-        for i, r in enumerate(results):
-            if isinstance(r, Exception):
-                outputs.append({
-                    "worker_id": assignments[i]["worker_id"],
-                    "status": "failed",
-                    "error": str(r),
-                })
-            else:
-                outputs.append(r)
-        return outputs
+        return all_results
 
     t0 = time.monotonic()
     results = asyncio.run(_scrape())
