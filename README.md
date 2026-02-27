@@ -1,6 +1,6 @@
 # polymarket
 
-Detecting insider trading on [Polymarket](https://polymarket.com) by analyzing 151M+ historical trades across 496K prediction markets.
+Detecting insider trading on [Polymarket](https://polymarket.com) by analyzing 631M+ historical order fills across 496K prediction markets.
 
 ## Pipeline Overview
 
@@ -30,11 +30,13 @@ To swap in test or dummy data, set the `POLYMARKET_DATA_DIR` environment variabl
 - Bulk historical data was downloaded from [warproxxx/poly_data](https://github.com/warproxxx/poly_data)
 - New events since the bulk download are scraped from the [Goldsky GraphQL subgraph](https://api.goldsky.com)
 
-`2-ingest/` contains the original single-threaded scraper (`update_goldsky.py`), market fetcher, and trade processor. `1-scrape/` replaces only the Goldsky scraping step with a 20-worker async scraper that partitions the time range by event density — roughly 40x faster.
+`2-ingest/` contains the original single-threaded scraper (`update_goldsky.py`), market fetcher, and trade processor. `1-scrape/` replaces only the Goldsky scraping step with a parallel scraper that partitions the time range by event density. It can run locally (`scrape.py`, 20 async workers) or fan out across many Modal containers (`modal_scrape.py`) for horizontal scaling.
 
 ```
 1-scrape/
-├── scrape.py           # parallel Goldsky scraper → data/scrape/
+├── scrape.py           # parallel Goldsky scraper (local) → data/scrape/
+├── modal_scrape.py     # multi-machine scraper (Modal) → volume:/scrape/
+├── modal_scan.py       # validate scraped chunks on volume
 
 2-ingest/
 ├── update_all.py       # orchestrates market fetch + goldsky scrape + trade processing
@@ -53,6 +55,9 @@ Raw order fills only have token IDs and amounts. `process_trades.py` joins them 
 When using the parallel scraper, concatenate its output chunks first:
 
 ```bash
+# if chunks are on Modal volume, download them first
+modal volume get polymarket-data /scrape/ insider-trading/data/scrape/
+
 # decompress and concatenate chunks into the expected input location
 zcat data/scrape/chunk_00_*.csv.gz > data/ingest/goldsky/orderFilled.csv
 for f in data/scrape/chunk_{01..19}_*.csv.gz; do
@@ -84,6 +89,49 @@ A Streamlit app for exploring results: wallet leaderboard, per-wallet drill-down
 
 ```bash
 cd insider-trading/4-dashboard && uv run streamlit run app.py
+```
+
+## Scraping on Modal
+
+The Goldsky subgraph has 631M+ order fill events. Scraping locally with `scrape.py` works but is slow. `modal_scrape.py` fans the work across many containers for horizontal speedup, and `modal_scan.py` validates the results.
+
+### Scrape
+
+```bash
+cd insider-trading/1-scrape
+
+# Full scrape: 20 containers x 20 workers = 400 parallel workers
+modal run modal_scrape.py --containers 20
+
+# Scrape a specific time range
+modal run modal_scrape.py --start 2026-02-23 --end 2026-02-26 --containers 3 --wpc 5
+
+# Start supports relative durations, ISO dates, ISO datetimes, or unix timestamps
+modal run modal_scrape.py --start 7d                        # last 7 days
+modal run modal_scrape.py --start 2026-02-23T09:08:04       # ISO datetime
+modal run modal_scrape.py --start 1759855190                # unix ts
+```
+
+Chunks are written to the `polymarket-data` Modal volume under `/scrape/`.
+
+### Scan (validate chunks)
+
+```bash
+cd insider-trading/1-scrape
+
+# Quick scan — filenames and sizes only (~5s)
+modal run modal_scan.py
+
+# Full scan — decompress every chunk, count rows, check time ranges (~2 min)
+modal run modal_scan.py --full
+```
+
+The full scan reports per-worker row counts, time coverage, corrupt files, and gaps.
+
+### Download results
+
+```bash
+modal volume get polymarket-data /scrape/ insider-trading/data/scrape/
 ```
 
 ## Running Analysis on Modal
