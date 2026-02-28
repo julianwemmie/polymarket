@@ -24,7 +24,7 @@ app = modal.App("polymarket-explore")
 
 # Ensure pipeline code is importable inside the container
 PIPELINE_PARENT = "/app"
-DATA_DIR = os.path.join(VOL_PATH, "runs", "2026-02-27")
+DATA_DIR = os.path.join(VOL_PATH, "runs", "2026-02-27-take-2")
 
 
 def _ensure_path():

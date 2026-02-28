@@ -160,7 +160,7 @@ def main():
     print(f"  Wallets with resolved bets: {len(wallet_stats):,}")
     print(f"  Overall mean Brier score: {overall_brier:.4f}")
     print(f"  Overall mean consensus Brier: {overall_consensus:.4f}")
-    print(f"  Naive Brier (0.5 on everything): {NAIVE_BRIER:.4f}")
+    print(f"  Naive Brier (0.5 on everything): 0.2500")
     print(
         f"  Flagged wallets (skill vs consensus > {FLAG_BRIER_SKILL:.0%}, "
         f"{MIN_RESOLVED_BETS}+ bets): {len(flagged):,}"

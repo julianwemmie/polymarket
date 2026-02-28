@@ -50,7 +50,7 @@ DEFAULT_GAP_START_TS = 1759855190   # 2025-10-07 16:39:50 UTC (last record in ar
 GAP_START_TS = DEFAULT_GAP_START_TS
 
 # Number of density probes to estimate event counts across the gap
-DENSITY_PROBE_COUNT = 120
+DENSITY_PROBE_COUNT = 600
 
 # CSV columns (matching existing schema)
 CSV_COLUMNS = [

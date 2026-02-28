@@ -1,8 +1,9 @@
 """
-Modal cloud runner for ingest pipeline (trades processing).
+Modal cloud runner for ingest pipeline (trades + activity processing).
 
 Reads raw scrape data from /vol/scrape/ on the Modal volume,
-processes OrderFilled events into structured trades.
+processes OrderFilled events into structured trades and
+activity events (splits/merges/redemptions) into synthetic trades.
 
 Prerequisites (run scrape first):
     modal run modal_app/scrape.py --task all
@@ -13,6 +14,7 @@ Run:
 
 Download results:
     modal volume get polymarket-data /ingest/trades/ ./data/ingest/trades/
+    modal volume get polymarket-data /ingest/activity/ ./data/ingest/activity/
 """
 
 from typing import Optional
@@ -47,9 +49,32 @@ def process_trades(output_base: str = VOL_PATH):
     vol.commit()
 
 
+@app.function(
+    image=ingest_image,
+    volumes={VOL_PATH: vol},
+    cpu=4,
+    memory=16384,
+    timeout=3600,
+)
+def process_activity(output_base: str = VOL_PATH):
+    """Process activity events (splits/merges/redemptions) into synthetic trades."""
+    import subprocess
+    import os
+
+    env = {
+        **os.environ,
+        "POLYMARKET_DATA_DIR": output_base,
+        "PYTHONPATH": "/app",
+    }
+    result = subprocess.run(["python", "-u", "/app/pipeline/ingest/activity.py"], env=env)
+    if result.returncode != 0:
+        raise RuntimeError(f"activity processing failed (exit {result.returncode})")
+    vol.commit()
+
+
 @app.local_entrypoint()
 def main(output_dir: Optional[str] = None):
-    """Run ingest pipeline: process trades from raw scrape data.
+    """Run ingest pipeline: process trades + activity from raw scrape data.
 
     --output-dir: override base output directory on the volume (default: /vol)
     """
@@ -69,9 +94,14 @@ def main(output_dir: Optional[str] = None):
     process_trades.remote(output_base=out)
     print("  Done!")
 
+    print("\nProcessing activity events...")
+    process_activity.remote(output_base=out)
+    print("  Done!")
+
     elapsed = time.monotonic() - t0
     print(f"\n{'=' * 60}")
     print(f"INGEST COMPLETE ({elapsed:.0f}s)")
     print(f"{'=' * 60}")
     print(f"\nDownload:")
     print(f"  modal volume get polymarket-data {out.removeprefix(VOL_PATH)}/ingest/trades/ ./data/ingest/trades/")
+    print(f"  modal volume get polymarket-data {out.removeprefix(VOL_PATH)}/ingest/activity/ ./data/ingest/activity/")

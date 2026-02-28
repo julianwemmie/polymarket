@@ -29,6 +29,14 @@ scrape_image = _with_modal_app(
     .add_local_file("pipeline/scrape/scraper.py", "/app/scraper.py")
 )
 
+# Activity scraper (splits/merges/redemptions from activity-subgraph)
+activity_scrape_image = _with_modal_app(
+    _base
+    .pip_install("aiohttp>=3.9")
+    .env({"POLYMARKET_DATA_DIR": VOL_PATH})
+    .add_local_dir("pipeline", remote_path="/app/pipeline")
+)
+
 # Historical download + markets fetcher
 fetch_image = _with_modal_app(
     _base

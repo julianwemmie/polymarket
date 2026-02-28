@@ -5,13 +5,15 @@ Tasks:
     gap          Scrape recent OrderFilled events from Goldsky (default)
     historical   Download bulk historical data from S3
     markets      Fetch market metadata from Polymarket API
-    all          Run all three tasks
+    activity     Scrape splits/merges/redemptions from activity-subgraph
+    all          Run all four tasks
 
 Usage:
     modal run modal_app/scrape.py                                    # gap scrape (default)
     modal run modal_app/scrape.py --task historical                  # download bulk archive
     modal run modal_app/scrape.py --task markets                     # fetch market metadata
-    modal run modal_app/scrape.py --task all                         # run all three
+    modal run modal_app/scrape.py --task activity                    # scrape activity events
+    modal run modal_app/scrape.py --task all                         # run all four
     modal run modal_app/scrape.py --containers 10                    # 10 x 20 = 200 workers
     modal run modal_app/scrape.py --start 7d                         # scrape last 7 days
     modal run modal_app/scrape.py --start 2026-02-23 --end 2026-02-26
@@ -24,7 +26,7 @@ from typing import Optional
 
 import modal
 
-from modal_app.common import vol, scrape_image, fetch_image, VOL_PATH, DEFAULT_GAP_START_TS
+from modal_app.common import vol, scrape_image, activity_scrape_image, fetch_image, VOL_PATH, DEFAULT_GAP_START_TS
 
 app = modal.App("polymarket-scraper")
 
@@ -70,6 +72,78 @@ def fetch_markets(output_base: str = ""):
     import markets
     markets.fetch_markets()
     vol.commit()
+
+
+# ---------------------------------------------------------------------------
+# Activity scraper (splits/merges/redemptions)
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    image=activity_scrape_image,
+    volumes={VOL_PATH: vol},
+    cpu=2,
+    memory=4096,
+    timeout=3600,
+)
+def probe_activity_density(
+    total_workers: int,
+    start_ts: int,
+    end_ts: int,
+) -> dict:
+    """Run density probing for activity events and return the partition plan."""
+    import asyncio
+    import sys
+
+    import aiohttp
+
+    sys.path.insert(0, "/app")
+    from pipeline.scrape.activity import estimate_partitions, MAX_CONCURRENT_REQUESTS
+
+    async def _probe():
+        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        timeout = aiohttp.ClientTimeout(total=120, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            partitions, estimated_total = await estimate_partitions(
+                session, total_workers, start_ts, end_ts, semaphore=sem
+            )
+            return {
+                "partitions": [
+                    {"worker_id": i, "start_ts": s, "end_ts": e}
+                    for i, (s, e) in enumerate(partitions)
+                ],
+                "estimated_total": estimated_total,
+                "actual_workers": len(partitions),
+            }
+
+    return asyncio.run(_probe())
+
+
+@app.function(
+    image=activity_scrape_image,
+    volumes={VOL_PATH: vol},
+    cpu=2,
+    memory=4096,
+    timeout=7200,
+)
+def scrape_activity_group(
+    assignments: list[dict],
+    concurrency: int = 8,
+    output_base: str = "",
+) -> list[dict]:
+    """Scrape assigned activity partitions concurrently.
+
+    Each assignment: {"worker_id": int, "start_ts": int, "end_ts": int}
+    """
+    import os
+    import sys
+    if output_base:
+        os.environ["POLYMARKET_DATA_DIR"] = output_base
+    sys.path.insert(0, "/app")
+    from pipeline.scrape.activity import scrape_partition_group
+    results = scrape_partition_group(assignments, concurrency=concurrency)
+    vol.commit()
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +669,140 @@ def _run_gap_scrape(
             print(f"    Worker {e['worker_id']}: {e.get('error', 'unknown')}")
 
 
+def _run_activity_scrape(
+    containers: int,
+    wpc: int,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    output_base: str = "",
+):
+    """Run multi-machine activity scraping (splits/merges/redemptions)."""
+    import math
+    import time
+    from datetime import datetime, timezone
+
+    total_workers = containers * wpc
+
+    start_ts = 1590969600  # 2020-06-01 UTC (Polymarket CTF exchange launch)
+    if start is not None:
+        start_ts = _parse_ts(start)
+
+    if end is not None:
+        end_ts = _parse_ts(end)
+    else:
+        end_ts = int(datetime.now(tz=timezone.utc).timestamp())
+
+    per_container_concurrency = max(wpc + 2, 8)
+
+    start_str = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    end_str = datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    range_days = (end_ts - start_ts) / 86400
+
+    print("=" * 60)
+    print("Modal Activity Scraper")
+    print("=" * 60)
+    print(f"  Containers:         {containers}")
+    print(f"  Workers/container:  {wpc}")
+    print(f"  Total workers:      {total_workers}")
+    print(f"  Time range:         {start_str} -> {end_str} ({range_days:.0f}d)")
+    print(f"  Concurrency/cont:   {per_container_concurrency}")
+    print()
+
+    # Step 1: Probe density
+    print(f"Step 1/3: Probing event density ({total_workers} partitions)...")
+    t0 = time.monotonic()
+
+    plan = probe_activity_density.remote(total_workers, start_ts, end_ts)
+
+    partitions = plan["partitions"]
+    actual_workers = plan["actual_workers"]
+    estimated_total = plan["estimated_total"]
+
+    probe_time = time.monotonic() - t0
+    print(f"  Done in {probe_time:.0f}s")
+    print(f"  Partitions:   {actual_workers}")
+    print(f"  Est. events:  {estimated_total:,}")
+
+    if actual_workers < total_workers:
+        total_workers = actual_workers
+        containers = math.ceil(actual_workers / wpc)
+        print(f"  Adjusted to {containers} containers "
+              f"({actual_workers} partitions)")
+
+    # Step 2: Verify & distribute
+    print(f"\nStep 2/3: Verifying partition plan...")
+
+    verify_partitions(partitions, start_ts, end_ts)
+    print("  Partitions verified: contiguous, no overlaps, no gaps")
+
+    for p in partitions:
+        p_start_str = datetime.fromtimestamp(
+            p["start_ts"], tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M")
+        p_end_str = datetime.fromtimestamp(
+            p["end_ts"], tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M")
+        days = (p["end_ts"] - p["start_ts"]) / 86400
+        print(f"    W{p['worker_id']:02d}: {p_start_str} -> {p_end_str} ({days:.1f}d)")
+
+    # Step 3: Fan out
+    estimated_per_worker = (
+        estimated_total // actual_workers if actual_workers > 0 else 0
+    )
+
+    print(f"\nStep 3/3: Launching {containers} containers...")
+    print(f"  Est. events/worker: {estimated_per_worker:,}")
+    t0 = time.monotonic()
+
+    handles = []
+    for c in range(containers):
+        chunk_start = c * wpc
+        chunk_end = min(chunk_start + wpc, actual_workers)
+        if chunk_start >= actual_workers:
+            break
+        batch = partitions[chunk_start:chunk_end]
+        wids = [p["worker_id"] for p in batch]
+        print(f"  Container {c}: workers {wids}")
+        handles.append(
+            scrape_activity_group.spawn(
+                batch,
+                concurrency=per_container_concurrency,
+                output_base=output_base,
+            )
+        )
+
+    all_results = []
+    for i, h in enumerate(handles):
+        results = h.get()
+        all_results.extend(results)
+        rows = sum(r.get("rows", 0) for r in results)
+        failed = sum(1 for r in results if r.get("status") == "failed")
+        status = f", {failed} FAILED" if failed else ""
+        print(f"  Container {i} done: {rows:,} rows{status}")
+
+    scrape_time = time.monotonic() - t0
+    total_rows = sum(r.get("rows", 0) for r in all_results)
+    errors = [r for r in all_results if r.get("status") == "failed"]
+    total_time = probe_time + scrape_time
+
+    print(f"\n{'=' * 60}")
+    print("ACTIVITY SCRAPE COMPLETE")
+    print(f"{'=' * 60}")
+    print(f"  Total rows:  {total_rows:,}")
+    print(f"  Probe time:  {probe_time:.0f}s")
+    print(f"  Scrape time: {scrape_time:.0f}s")
+    print(f"  Total time:  {total_time:.0f}s ({total_time / 60:.1f} min)")
+    if scrape_time > 0:
+        print(f"  Throughput:  {total_rows / scrape_time:,.0f} rows/s")
+    print(f"  Containers:  {len(handles)}")
+    print(f"  Workers:     {actual_workers}")
+
+    if errors:
+        print(f"\n  ERRORS: {len(errors)}")
+        for e in errors:
+            print(f"    Worker {e.get('worker_id', '?')}: {e.get('error', 'unknown')}")
+
+
 @app.local_entrypoint()
 def main(
     task: str = "gap",
@@ -607,7 +815,7 @@ def main(
 ):
     """Orchestrate scraping tasks.
 
-    --task: gap (default), historical, markets, all
+    --task: gap (default), historical, markets, activity, all
     --output-dir: override base output directory on the volume (default: /vol)
     """
     out = output_dir or ""
@@ -622,8 +830,10 @@ def main(
         print("Fetching market metadata...")
         fetch_markets.remote(output_base=out)
         print("Done!")
+    elif task == "activity":
+        _run_activity_scrape(containers, wpc, start=start, end=end, output_base=out)
     elif task == "all":
-        # Run historical + markets in parallel, then gap scrape
+        # Run historical + markets in parallel first, then gap + activity
         print("Running all scrape tasks...")
         print()
 
@@ -639,8 +849,11 @@ def main(
         print("Markets fetch complete!")
 
         print()
+        _run_activity_scrape(containers, wpc, output_base=out)  # always full range for --task all
+
+        print()
         _run_gap_scrape(containers, wpc, start, end, max_batches, output_base=out)
     else:
         raise ValueError(
-            f"Unknown task: {task}. Use 'gap', 'historical', 'markets', or 'all'."
+            f"Unknown task: {task}. Use 'gap', 'historical', 'markets', 'activity', or 'all'."
         )

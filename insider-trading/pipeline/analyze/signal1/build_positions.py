@@ -30,6 +30,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
 TRADES_DIR = DATA_ROOT / "ingest" / "trades"
+ACTIVITY_DIR = DATA_ROOT / "ingest" / "activity"
 MARKETS_PATH = DATA_ROOT / "scrape" / "markets.csv"
 OUTPUT_DIR = DATA_ROOT / "analyze" / "signal1"
 OUTPUT_PATH = OUTPUT_DIR / "wallet_positions.parquet"
@@ -235,9 +236,11 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     trades_dir = TRADES_DIR.resolve()
+    activity_dir = ACTIVITY_DIR.resolve()
     markets_path = MARKETS_PATH.resolve()
 
-    print(f"Trades dir:  {trades_dir}")
+    print(f"Trades dir:   {trades_dir}")
+    print(f"Activity dir: {activity_dir}")
     print(f"Markets file: {markets_path}")
 
     if not trades_dir.exists():
@@ -246,6 +249,10 @@ def main():
         raise FileNotFoundError(f"Markets file not found: {markets_path}")
 
     part_files = sorted(trades_dir.glob("*.parquet"))
+    if activity_dir.exists():
+        activity_files = sorted(activity_dir.glob("*.parquet"))
+        print(f"  Activity files: {len(activity_files)}")
+        part_files += activity_files
     if not part_files:
         raise FileNotFoundError(f"No Parquet files found in {trades_dir}")
 
