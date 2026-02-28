@@ -29,6 +29,14 @@ scrape_image = _with_modal_app(
     .add_local_file("pipeline/scrape/scraper.py", "/app/scraper.py")
 )
 
+# Activity scraper (splits/merges/redemptions from activity-subgraph)
+activity_scrape_image = _with_modal_app(
+    _base
+    .pip_install("aiohttp>=3.9")
+    .env({"POLYMARKET_DATA_DIR": VOL_PATH})
+    .add_local_dir("pipeline", remote_path="/app/pipeline")
+)
+
 # Historical download + markets fetcher
 fetch_image = _with_modal_app(
     _base
@@ -38,7 +46,7 @@ fetch_image = _with_modal_app(
     .add_local_file("pipeline/scrape/markets.py", "/app/markets.py")
 )
 
-# Ingest: consolidate + trades processing
+# Ingest: trades processing (reads directly from scrape sources)
 # Mounts full pipeline/ so `from pipeline.utils.helpers` imports work
 ingest_image = _with_modal_app(
     _base
@@ -54,4 +62,13 @@ analysis_image = _with_modal_app(
     _base
     .pip_install("polars>=1.0.0")
     .env({"POLYMARKET_DATA_DIR": VOL_PATH})
+)
+
+# Explore: on-demand analysis with both signal pipelines + DuckDB
+explore_image = _with_modal_app(
+    _base
+    .pip_install("polars>=1.0.0", "duckdb>=1.1", "pyarrow>=14.0")
+    .env({"POLYMARKET_DATA_DIR": VOL_PATH})
+    .add_local_dir("pipeline/analyze/signal1", remote_path="/app/pipeline/analyze/signal1")
+    .add_local_dir("pipeline/analyze/signal2", remote_path="/app/pipeline/analyze/signal2")
 )

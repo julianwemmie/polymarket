@@ -7,7 +7,7 @@
 Run all signal1 (implausibility) analysis scripts.
 
 Order:
-  1. build_wallet_positions  (reads trades.csv -> wallet_positions.parquet)
+  1. build_wallet_positions  (reads trades/ -> wallet_positions.parquet)
      Skipped if wallet_positions.parquet already exists. Use --rebuild to force.
   2. 8 metric scripts sequentially (each loads wallet_positions.parquet)
   3. aggregate_score (reads all 8 metric outputs)
@@ -20,7 +20,7 @@ Memory safety:
 Usage:
   cd pipeline/analyze/signal1
   uv run run_all.py            # skip build if output exists
-  uv run run_all.py --rebuild  # force rebuild from trades.csv
+  uv run run_all.py --rebuild  # force rebuild from trades/
 """
 import os
 import subprocess

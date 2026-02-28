@@ -24,6 +24,11 @@ def _path(signal: int, name: str) -> str:
     return str(base / name)
 
 
+def signal2_available() -> bool:
+    """Check whether signal 2 parquet files exist on disk."""
+    return (SIGNAL2 / "timing_scores.parquet").exists()
+
+
 # ---------------------------------------------------------------------------
 # Signal 1 queries
 # ---------------------------------------------------------------------------
@@ -99,8 +104,50 @@ def leaderboard(
     sort_by: str = "aggregate_score",
 ) -> list[dict]:
     conn = get_conn()
-    return conn.sql(f"""
-        WITH s1 AS (
+    if signal2_available():
+        return conn.sql(f"""
+            WITH s1 AS (
+                SELECT
+                    wallet,
+                    aggregate_score,
+                    suspicion_rank,
+                    num_metrics_available,
+                    score_roi,
+                    score_profit_factor,
+                    score_brier_score,
+                    score_contrarian_win_rate,
+                    score_win_streak,
+                    score_bet_size_vs_odds,
+                    score_position_concentration,
+                    score_niche_market_accuracy
+                FROM '{_path(1, "aggregate_scores.parquet")}'
+                WHERE num_metrics_available >= {min_metrics}
+                  AND aggregate_score >= {min_score}
+            ),
+            s2 AS (
+                SELECT
+                    wallet,
+                    num_spikes_preceded,
+                    hit_rate,
+                    total_pre_spike_usd,
+                    excess_ratio,
+                    is_flagged AS timing_flagged
+                FROM '{_path(2, "timing_scores.parquet")}'
+            )
+            SELECT
+                s1.*,
+                s2.num_spikes_preceded,
+                s2.hit_rate AS timing_hit_rate,
+                s2.total_pre_spike_usd,
+                s2.excess_ratio AS timing_excess_ratio,
+                COALESCE(s2.timing_flagged, false) AS timing_flagged
+            FROM s1
+            LEFT JOIN s2 ON s1.wallet = s2.wallet
+            ORDER BY {sort_by} DESC
+            LIMIT {limit}
+        """).fetchdf().to_dict("records")
+    else:
+        return conn.sql(f"""
             SELECT
                 wallet,
                 aggregate_score,
@@ -113,33 +160,18 @@ def leaderboard(
                 score_win_streak,
                 score_bet_size_vs_odds,
                 score_position_concentration,
-                score_niche_market_accuracy
+                score_niche_market_accuracy,
+                NULL AS num_spikes_preceded,
+                NULL AS timing_hit_rate,
+                NULL AS total_pre_spike_usd,
+                NULL AS timing_excess_ratio,
+                false AS timing_flagged
             FROM '{_path(1, "aggregate_scores.parquet")}'
             WHERE num_metrics_available >= {min_metrics}
               AND aggregate_score >= {min_score}
-        ),
-        s2 AS (
-            SELECT
-                wallet,
-                num_spikes_preceded,
-                hit_rate,
-                total_pre_spike_usd,
-                excess_ratio,
-                is_flagged AS timing_flagged
-            FROM '{_path(2, "timing_scores.parquet")}'
-        )
-        SELECT
-            s1.*,
-            s2.num_spikes_preceded,
-            s2.hit_rate AS timing_hit_rate,
-            s2.total_pre_spike_usd,
-            s2.excess_ratio AS timing_excess_ratio,
-            COALESCE(s2.timing_flagged, false) AS timing_flagged
-        FROM s1
-        LEFT JOIN s2 ON s1.wallet = s2.wallet
-        ORDER BY {sort_by} DESC
-        LIMIT {limit}
-    """).fetchdf().to_dict("records")
+            ORDER BY {sort_by} DESC
+            LIMIT {limit}
+        """).fetchdf().to_dict("records")
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +234,8 @@ def wallet_positions(wallet: str, limit: int = 200) -> list[dict]:
 
 @st.cache_data(ttl=3600)
 def wallet_timing(wallet: str) -> dict | None:
+    if not signal2_available():
+        return None
     conn = get_conn()
     rows = conn.sql(f"""
         SELECT * FROM '{_path(2, "timing_scores.parquet")}' WHERE wallet = '{wallet}'
@@ -238,6 +272,8 @@ def wallet_concentration(wallet: str) -> dict | None:
 
 @st.cache_data(ttl=3600)
 def wallet_pre_spike_trades(wallet: str, limit: int = 200) -> list[dict]:
+    if not signal2_available():
+        return []
     conn = get_conn()
     return conn.sql(f"""
         SELECT
@@ -267,7 +303,9 @@ def wallet_pre_spike_trades(wallet: str, limit: int = 200) -> list[dict]:
 
 
 @st.cache_data(ttl=3600)
-def timing_overview() -> dict:
+def timing_overview() -> dict | None:
+    if not signal2_available():
+        return None
     conn = get_conn()
     row = conn.sql(f"""
         SELECT
@@ -294,6 +332,8 @@ def timing_overview() -> dict:
 
 @st.cache_data(ttl=3600)
 def top_timing_wallets(limit: int = 100) -> list[dict]:
+    if not signal2_available():
+        return []
     conn = get_conn()
     return conn.sql(f"""
         SELECT
@@ -315,6 +355,8 @@ def top_timing_wallets(limit: int = 100) -> list[dict]:
 
 @st.cache_data(ttl=3600)
 def spike_magnitude_distribution() -> list[dict]:
+    if not signal2_available():
+        return []
     conn = get_conn()
     return conn.sql(f"""
         SELECT

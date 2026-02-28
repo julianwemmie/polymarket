@@ -14,8 +14,8 @@ downstream timing_score.py can compute hit_rate (fraction of trades in the
 correct direction).
 
 Input:
-  - output/price_spikes.parquet       (from step 2)
-  - data/ingest/trades.csv  (151M rows, 33 GB)
+  - output/price_spikes.parquet            (from step 2)
+  - data/ingest/trades/ (partitioned Parquet)
 Output:
   - output/pre_spike_trades.parquet
 
@@ -33,14 +33,14 @@ Columns produced:
 
 Strategy:
   1. Load price_spikes.parquet and compute pre-spike time windows.
-  2. Stream through trades.csv in chunks. For each chunk:
+  2. Iterate through trade part-files. For each part:
      a. Filter to only market_ids that have spikes.
      b. Join trades with spike windows on market_id (vectorized).
      c. Filter to trades where timestamp falls within the pre-spike window.
      d. Compute correct_direction and lead_time_minutes.
   3. Concat all matches and write to parquet.
 
-Memory: Spikes table stays in memory. Trades are streamed in chunks.
+Memory: Spikes table stays in memory. Trades processed one part-file at a time.
   The join temporarily expands each chunk (~trades × spikes_per_market)
   but the timestamp filter immediately reduces it.
 
@@ -61,7 +61,6 @@ import polars as pl
 # ---------------------------------------------------------------------------
 PRE_SPIKE_START_HOURS = 4         # How far back before spike_start to look (hours)
 PRE_SPIKE_END_MINUTES = 30        # Stop looking this close to spike_start (minutes)
-CHUNK_SIZE = 2_000_000            # Rows per chunk for trades.csv
 MIN_USD_AMOUNT = 1.0              # Minimum trade size to consider (filter dust)
 
 # ---------------------------------------------------------------------------
@@ -72,7 +71,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
 OUTPUT_DIR = DATA_ROOT / "analyze" / "signal2"
 SPIKES_FILE = OUTPUT_DIR / "price_spikes.parquet"
-TRADES_CSV = DATA_ROOT / "ingest" / "trades.csv"
+TRADES_DIR = DATA_ROOT / "ingest" / "trades"
 OUTPUT_FILE = OUTPUT_DIR / "pre_spike_trades.parquet"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -146,10 +145,83 @@ def extract_all_wallet_trades(chunk: pl.DataFrame) -> pl.DataFrame:
     return combined.drop("transactionHash")
 
 
+def find_pre_spike_wallets(spikes_df: pl.DataFrame, trades_df: pl.DataFrame) -> pl.DataFrame:
+    """Find wallets that traded in pre-spike windows.
+
+    Accepts spikes (from detect_spikes_for_market) and trades DataFrames.
+    Returns pre-spike trades in the same schema as pre_spike_trades.parquet.
+    """
+    if len(spikes_df) == 0 or len(trades_df) == 0:
+        return pl.DataFrame(schema=OUTPUT_SCHEMA)
+
+    spikes = build_spike_windows(spikes_df)
+
+    spike_windows = spikes.select(
+        "spike_id", "market_id", "direction", "window_start", "window_end", "spike_start_ts",
+    )
+    spike_market_ids = spikes["market_id"].unique().to_list()
+
+    # Filter trades to spike markets and minimum size
+    chunk = trades_df.filter(
+        pl.col("market_id").is_in(spike_market_ids)
+        & (pl.col("usd_amount") >= MIN_USD_AMOUNT)
+    )
+
+    if len(chunk) == 0:
+        return pl.DataFrame(schema=OUTPUT_SCHEMA)
+
+    wallet_trades = extract_all_wallet_trades(chunk)
+
+    if len(wallet_trades) == 0:
+        return pl.DataFrame(schema=OUTPUT_SCHEMA)
+
+    wallet_trades = wallet_trades.with_columns(
+        pl.col("side").str.to_uppercase(),
+    )
+
+    joined = wallet_trades.join(spike_windows, on="market_id", how="inner")
+
+    matched = joined.filter(
+        (pl.col("timestamp") >= pl.col("window_start"))
+        & (pl.col("timestamp") <= pl.col("window_end"))
+    )
+
+    if len(matched) == 0:
+        return pl.DataFrame(schema=OUTPUT_SCHEMA)
+
+    matched = matched.with_columns(
+        ((pl.col("spike_start_ts") - pl.col("timestamp")).dt.total_minutes()).alias("lead_time_minutes"),
+        (
+            ((pl.col("side") == "BUY") & (pl.col("direction") == "up"))
+            | ((pl.col("side") == "SELL") & (pl.col("direction") == "down"))
+        ).alias("correct_direction"),
+    ).select(
+        "wallet", "market_id", "spike_id",
+        pl.col("timestamp").alias("entry_timestamp"),
+        "lead_time_minutes", "usd_amount",
+        pl.col("price").alias("entry_price"),
+        "direction", "side", "correct_direction",
+    )
+
+    # Deduplicate
+    result = (
+        matched
+        .group_by(["wallet", "spike_id", "entry_timestamp", "market_id",
+                    "direction", "side", "correct_direction"])
+        .agg(
+            pl.col("usd_amount").sum(),
+            pl.col("entry_price").mean(),
+            pl.col("lead_time_minutes").first(),
+        )
+    )
+
+    return result.sort("spike_id", "wallet", "entry_timestamp")
+
+
 def main() -> None:
     print(f"[pre_spike_wallets] Starting...")
     print(f"  Spikes file:      {SPIKES_FILE}")
-    print(f"  Trades CSV:       {TRADES_CSV}")
+    print(f"  Trades dir:       {TRADES_DIR}")
     print(f"  Output:           {OUTPUT_FILE}")
     print(f"  Pre-spike window: {PRE_SPIKE_END_MINUTES}min to {PRE_SPIKE_START_HOURS}hrs before spike")
     print(f"  Min USD amount:   ${MIN_USD_AMOUNT}")
@@ -160,8 +232,12 @@ def main() -> None:
             f"Spikes file not found: {SPIKES_FILE}\n"
             "Run detect_price_spikes.py first."
         )
-    if not TRADES_CSV.exists():
-        raise FileNotFoundError(f"Trades CSV not found: {TRADES_CSV}")
+    if not TRADES_DIR.exists():
+        raise FileNotFoundError(f"Trades directory not found: {TRADES_DIR}")
+
+    part_files = sorted(TRADES_DIR.glob("*.parquet"))
+    if not part_files:
+        raise FileNotFoundError(f"No Parquet files found in {TRADES_DIR}")
 
     t0 = time.time()
 
@@ -186,53 +262,23 @@ def main() -> None:
     )
     spike_market_ids = spikes["market_id"].unique().to_list()
 
-    # Stream through trades.csv and match against spike windows via join
-    print(f"\n  Streaming trades.csv...", flush=True)
-    reader = pl.read_csv_batched(
-        TRADES_CSV,
-        batch_size=CHUNK_SIZE,
-        schema_overrides={
-            "timestamp": pl.String,
-            "market_id": pl.Int64,
-            "maker": pl.String,
-            "taker": pl.String,
-            "maker_direction": pl.String,
-            "taker_direction": pl.String,
-            "price": pl.Float64,
-            "usd_amount": pl.Float64,
-            "transactionHash": pl.String,
-        },
-        columns=["timestamp", "market_id", "maker", "taker",
-                  "maker_direction", "taker_direction", "price", "usd_amount",
-                  "transactionHash"],
-    )
+    # Iterate through trade part-files and match against spike windows via join
+    print(f"\n  Reading {len(part_files)} trade part-files...", flush=True)
 
     all_matches: list[pl.DataFrame] = []
     total_rows = 0
     total_matches = 0
     chunk_count = 0
 
-    while True:
-        batches = reader.next_batches(1)
-        if batches is None or len(batches) == 0:
-            break
-
-        chunk = batches[0]
+    for part_file in part_files:
+        chunk = pl.read_parquet(
+            part_file,
+            columns=["timestamp", "market_id", "maker", "taker",
+                      "maker_direction", "taker_direction", "price", "usd_amount",
+                      "transactionHash"],
+        )
         chunk_count += 1
         total_rows += len(chunk)
-
-        # Parse timestamps -- handle with and without fractional seconds
-        chunk = chunk.with_columns(
-            pl.col("timestamp").str.to_datetime(
-                "%Y-%m-%dT%H:%M:%S%.f", strict=False
-            ).alias("timestamp_parsed"),
-        )
-        chunk = chunk.with_columns(
-            pl.when(pl.col("timestamp_parsed").is_null())
-            .then(pl.col("timestamp").str.to_datetime("%Y-%m-%dT%H:%M:%S", strict=False))
-            .otherwise(pl.col("timestamp_parsed"))
-            .alias("timestamp"),
-        ).drop("timestamp_parsed")
 
         # Filter to only markets with spikes and trades above minimum size
         chunk = chunk.filter(
@@ -242,8 +288,7 @@ def main() -> None:
 
         if len(chunk) == 0:
             elapsed = time.time() - t0
-            pct_done = total_rows / 151_000_000 * 100
-            print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - no spike-market trades - {elapsed:.1f}s", flush=True)
+            print(f"  [{chunk_count}/{len(part_files)}] no spike-market trades - {elapsed:.1f}s", flush=True)
             continue
 
         # Extract ALL wallet trades (both BUY and SELL) from maker+taker
@@ -268,8 +313,7 @@ def main() -> None:
 
         if len(relevant_spikes) == 0:
             elapsed = time.time() - t0
-            pct_done = total_rows / 151_000_000 * 100
-            print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - no overlapping spikes - {elapsed:.1f}s", flush=True)
+            print(f"  [{chunk_count}/{len(part_files)}] no overlapping spikes - {elapsed:.1f}s", flush=True)
             continue
 
         # Vectorized join: pair each trade with all temporally-relevant spikes
@@ -283,8 +327,7 @@ def main() -> None:
 
         if len(matched) == 0:
             elapsed = time.time() - t0
-            pct_done = total_rows / 151_000_000 * 100
-            print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - 0 temporal matches - {elapsed:.1f}s", flush=True)
+            print(f"  [{chunk_count}/{len(part_files)}] 0 temporal matches - {elapsed:.1f}s", flush=True)
             continue
 
         # Compute derived fields
@@ -311,8 +354,7 @@ def main() -> None:
         total_matches += len(matched)
 
         elapsed = time.time() - t0
-        pct_done = total_rows / 151_000_000 * 100
-        print(f"  Chunk {chunk_count}/~76 ({pct_done:.0f}%) - "
+        print(f"  [{chunk_count}/{len(part_files)}] "
               f"{total_matches:,} total matches - {elapsed:.1f}s", flush=True)
 
     # Combine all matches

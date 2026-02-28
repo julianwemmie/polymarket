@@ -15,7 +15,7 @@ significantly exceed this baseline are flagged.
 Input:
   - output/pre_spike_trades.parquet   (from step 3)
   - output/price_spikes.parquet       (from step 2 -- for true spike counts)
-  - data/ingest/trades.csv  (for baseline: total trades per wallet)
+  - data/ingest/trades/ (partitioned Parquet, for baseline: total trades per wallet)
 Output:
   - output/timing_scores.parquet
 
@@ -56,8 +56,6 @@ MIN_MARKETS = 3                   # Minimum distinct markets with pre-spike trad
 EXCESS_THRESHOLD = 2.0            # Excess ratio above which a wallet is flagged
                                   # (2.0 = 2x more spikes preceded than baseline expectation)
 MIN_HIT_RATE = 0.50               # Minimum spike-level hit rate to flag a wallet
-CHUNK_SIZE = 2_000_000            # Rows per chunk for trades.csv (baseline computation)
-
 # Pre-spike window parameters (must match pre_spike_wallets.py)
 PRE_SPIKE_START_HOURS = 4
 PRE_SPIKE_END_MINUTES = 30
@@ -72,7 +70,7 @@ OUTPUT_DIR = DATA_ROOT / "analyze" / "signal2"
 PRE_SPIKE_FILE = OUTPUT_DIR / "pre_spike_trades.parquet"
 SPIKES_FILE = OUTPUT_DIR / "price_spikes.parquet"
 PRICE_HISTORY_FILE = OUTPUT_DIR / "price_history.parquet"
-TRADES_CSV = DATA_ROOT / "ingest" / "trades.csv"
+TRADES_DIR = DATA_ROOT / "ingest" / "trades"
 OUTPUT_FILE = OUTPUT_DIR / "timing_scores.parquet"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -165,7 +163,7 @@ def compute_wallet_activity_baseline(
     wallets_of_interest: set[str],
 ) -> pl.DataFrame:
     """
-    Stream through trades.csv and compute total trading activity per wallet
+    Read trade part-files and compute total trading activity per wallet
     (only for wallets that appear in pre-spike trades).
 
     Uses vectorized Polars operations: unpivots maker+taker into a single
@@ -174,21 +172,11 @@ def compute_wallet_activity_baseline(
     Returns DataFrame with columns:
       wallet (str), total_trades_all (u64), total_markets_all (u32)
     """
-    print("  Computing wallet activity baseline from trades.csv...")
+    print("  Computing wallet activity baseline from trades...")
 
     wallets_list = list(wallets_of_interest)
 
-    reader = pl.read_csv_batched(
-        TRADES_CSV,
-        batch_size=CHUNK_SIZE,
-        schema_overrides={
-            "market_id": pl.Int64,
-            "maker": pl.String,
-            "taker": pl.String,
-            "transactionHash": pl.String,
-        },
-        columns=["market_id", "maker", "taker", "transactionHash"],
-    )
+    part_files = sorted(TRADES_DIR.glob("*.parquet"))
 
     # Accumulate per-chunk aggregates and combine at the end.
     # Each partial has (wallet, market_id, trade_count).
@@ -197,12 +185,11 @@ def compute_wallet_activity_baseline(
     total_rows = 0
     t0 = time.time()
 
-    while True:
-        batches = reader.next_batches(1)
-        if batches is None or len(batches) == 0:
-            break
-
-        chunk = batches[0]
+    for part_file in part_files:
+        chunk = pl.read_parquet(
+            part_file,
+            columns=["market_id", "maker", "taker", "transactionHash"],
+        )
         chunk_count += 1
         total_rows += len(chunk)
 
@@ -239,8 +226,7 @@ def compute_wallet_activity_baseline(
 
         if chunk_count % 10 == 0:
             elapsed = time.time() - t0
-            pct_done = total_rows / 151_000_000 * 100
-            print(f"    Baseline chunk {chunk_count}/~76 ({pct_done:.0f}%) - {elapsed:.1f}s", flush=True)
+            print(f"    Baseline [{chunk_count}/{len(part_files)}] {total_rows:,} rows - {elapsed:.1f}s", flush=True)
 
         # Periodically compact
         if chunk_count % 50 == 0 and len(accumulated) > 20:
@@ -276,7 +262,7 @@ def main() -> None:
     print(f"[timing_score] Starting...")
     print(f"  Pre-spike file:        {PRE_SPIKE_FILE}")
     print(f"  Spikes file:           {SPIKES_FILE}")
-    print(f"  Trades CSV:            {TRADES_CSV}")
+    print(f"  Trades dir:            {TRADES_DIR}")
     print(f"  Output:                {OUTPUT_FILE}")
     print(f"  Min spike appearances: {MIN_SPIKE_APPEARANCES} (secondary)")
     print(f"  Min markets:           {MIN_MARKETS} (primary, per plan)")
@@ -294,8 +280,8 @@ def main() -> None:
             f"Price spikes not found: {SPIKES_FILE}\n"
             "Run detect_price_spikes.py first."
         )
-    if not TRADES_CSV.exists():
-        raise FileNotFoundError(f"Trades CSV not found: {TRADES_CSV}")
+    if not TRADES_DIR.exists():
+        raise FileNotFoundError(f"Trades directory not found: {TRADES_DIR}")
 
     t0 = time.time()
 

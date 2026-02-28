@@ -50,7 +50,7 @@ DEFAULT_GAP_START_TS = 1759855190   # 2025-10-07 16:39:50 UTC (last record in ar
 GAP_START_TS = DEFAULT_GAP_START_TS
 
 # Number of density probes to estimate event counts across the gap
-DENSITY_PROBE_COUNT = 40
+DENSITY_PROBE_COUNT = 600
 
 # CSV columns (matching existing schema)
 CSV_COLUMNS = [
@@ -109,6 +109,13 @@ logger.addHandler(_file_handler)
 # ---------------------------------------------------------------------------
 
 @dataclass
+class WorkerBounds:
+    """Mutable end boundary for a worker — supports work stealing."""
+    end_ts: int
+    original_end_ts: int  # the original end before any stealing
+
+
+@dataclass
 class WorkerState:
     worker_id: int
     rows: int = 0
@@ -117,6 +124,7 @@ class WorkerState:
     rate: float = 0.0         # rows/s
     start_time: float = 0.0
     last_ts_str: str = ""     # human-readable last timestamp
+    current_ts: int = 0       # last processed unix timestamp (for work stealing)
 
 
 @dataclass
@@ -686,8 +694,13 @@ async def worker(
     resume: bool,
     semaphore: asyncio.Semaphore | None = None,
     max_batches: int | None = None,
+    bounds: WorkerBounds | None = None,
 ) -> dict:
     """Scrape a single time partition and write to a gzipped CSV chunk.
+
+    If *bounds* is provided, the worker checks bounds.end_ts each batch
+    instead of using the fixed end_ts.  This allows a coordinator to shrink
+    the worker's range mid-flight for work stealing.
 
     Returns metadata dict for the manifest.
     """
@@ -805,12 +818,15 @@ async def worker(
 
     try:
         while True:
+            # Re-read end boundary each iteration (supports work stealing)
+            effective_end = bounds.end_ts if bounds else end_ts
+
             # --max-batches: stop early when set (useful for testing)
             if max_batches and batch_count >= max_batches:
                 break
 
             # Bug 1: Defensive upper-bound check for sticky_timestamp
-            if sticky_timestamp is not None and sticky_timestamp >= end_ts:
+            if sticky_timestamp is not None and sticky_timestamp >= effective_end:
                 break
 
             # Build where clause
@@ -821,13 +837,13 @@ async def worker(
                 # We already consumed last_timestamp, skip past it
                 where = (
                     f'timestamp_gt: "{last_timestamp}", '
-                    f'timestamp_lt: "{end_ts}"'
+                    f'timestamp_lt: "{effective_end}"'
                 )
             else:
                 # Very first batch: include the partition start boundary
                 where = (
                     f'timestamp_gte: "{last_timestamp}", '
-                    f'timestamp_lt: "{end_ts}"'
+                    f'timestamp_lt: "{effective_end}"'
                 )
 
             payload = build_query(where)
@@ -889,7 +905,7 @@ async def worker(
             gz_text.flush()
             save_cursor_state(
                 worker_id, last_timestamp, last_id, sticky_timestamp,
-                rows_written, part_number, start_ts, end_ts,
+                rows_written, part_number, start_ts, effective_end,
             )
 
             # Update progress state every batch
@@ -901,6 +917,7 @@ async def worker(
                 ws.batches = batch_count
                 ws.rate = rate
                 ws.last_ts_str = ts_to_str(batch_last_ts)
+                ws.current_ts = batch_last_ts
 
             # Log every 50 batches
             if batch_count % 50 == 0:
@@ -933,6 +950,9 @@ async def worker(
     # Clear cursor on completion
     clear_cursor(worker_id)
 
+    # Resolve the effective end boundary (may have been shrunk by work stealing)
+    actual_end = bounds.end_ts if bounds else end_ts
+
     # Bug 3: Collect per-part metadata (file, rows, md5, file_size_bytes)
     # so the manifest checksum covers ALL parts, not just the last one.
     part_pattern = f"chunk_{worker_id:02d}_{ts_to_date(start_ts)}_{ts_to_date(end_ts)}_part*.csv.gz"
@@ -958,9 +978,9 @@ async def worker(
     result = {
         "worker_id": worker_id,
         "start_ts": start_ts,
-        "end_ts": end_ts,
+        "end_ts": actual_end,
         "start_date": ts_to_str(start_ts),
-        "end_date": ts_to_str(end_ts),
+        "end_date": ts_to_str(actual_end),
         "chunk_files": [p.name for p in chunk_files],
         "parts": parts_meta,
         "rows": rows_written,

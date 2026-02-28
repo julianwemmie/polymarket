@@ -5,10 +5,10 @@
 """
 Step 0: Build per-wallet, per-market position summary from raw trades.
 
-Reads the 33 GB trades.csv in batches (polars read_csv_batched) and aggregates
-into per-(wallet, market_id, side) positions with volume-weighted avg entry price,
-total USD in (buys), total USD out (sells), net tokens, trade count, and
-first/last trade timestamps.
+Reads partitioned Parquet trade files and aggregates into per-(wallet,
+market_id, side) positions with volume-weighted avg entry price, total USD
+in (buys), total USD out (sells), net tokens, trade count, and first/last
+trade timestamps.
 
 Then joins with markets.csv to add market metadata and derives resolution outcome
 from final trade prices (markets that closed have final prices near 0 or 1).
@@ -29,12 +29,11 @@ import time
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ROOT = Path(os.environ.get("POLYMARKET_DATA_DIR", str(PROJECT_ROOT / "data")))
-TRADES_PATH = DATA_ROOT / "ingest" / "trades.csv"
+TRADES_DIR = DATA_ROOT / "ingest" / "trades"
+ACTIVITY_DIR = DATA_ROOT / "ingest" / "activity"
 MARKETS_PATH = DATA_ROOT / "scrape" / "markets.csv"
 OUTPUT_DIR = DATA_ROOT / "analyze" / "signal1"
 OUTPUT_PATH = OUTPUT_DIR / "wallet_positions.parquet"
-
-BATCH_SIZE = 2_000_000
 
 
 def process_batch(df: pl.DataFrame) -> pl.DataFrame:
@@ -133,10 +132,12 @@ def derive_resolution(markets: pl.DataFrame, last_prices: pl.DataFrame) -> pl.Da
     - If last price <= 0.15 -> token2 won (resolution = "token2")
     - Otherwise -> ambiguous / unresolved
     """
-    # Join last prices onto markets
-    markets_with_prices = markets.join(
-        last_prices, left_on="id", right_on="market_id", how="left"
-    )
+    # Join last prices onto markets (markets.id is str from CSV, market_id is i64 from trades)
+    markets_with_prices = markets.with_columns(
+        pl.col("id").cast(pl.Int64).alias("_join_id")
+    ).join(
+        last_prices, left_on="_join_id", right_on="market_id", how="left"
+    ).drop("_join_id")
 
     # Derive resolution
     markets_with_resolution = markets_with_prices.with_columns(
@@ -155,45 +156,109 @@ def derive_resolution(markets: pl.DataFrame, last_prices: pl.DataFrame) -> pl.Da
     return markets_with_resolution
 
 
+def build_positions_for_trades(trades_df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
+    """Build wallet positions from a pre-filtered trades DataFrame.
+
+    Accepts trades in the standard ingest schema and a markets DataFrame.
+    Returns positions in the same schema as wallet_positions.parquet.
+    Suitable for on-demand analysis of a single market or wallet's trades.
+    """
+    if len(trades_df) == 0:
+        return pl.DataFrame(schema={
+            "wallet": pl.String, "market_id": pl.Int64, "side": pl.String,
+            "total_usd_in": pl.Float64, "tokens_bought": pl.Float64,
+            "total_usd_out": pl.Float64, "tokens_sold": pl.Float64,
+            "num_trades": pl.UInt32, "first_trade_timestamp": pl.Datetime("us"),
+            "last_trade_timestamp": pl.Datetime("us"), "net_tokens": pl.Float64,
+            "avg_entry_price": pl.Float64, "market_volume": pl.Float64,
+            "closed_time": pl.String, "resolution": pl.String,
+            "market_question": pl.String, "position_won": pl.Boolean,
+        })
+
+    # Process all trades as a single batch
+    positions = process_batch(trades_df)
+
+    # Compute net_tokens and avg_entry_price
+    positions = positions.with_columns(
+        pl.max_horizontal(pl.col("tokens_bought") - pl.col("tokens_sold"), pl.lit(0.0)).alias("net_tokens"),
+        pl.when(pl.col("tokens_bought") > 0)
+        .then(pl.col("total_usd_in") / pl.col("tokens_bought"))
+        .otherwise(pl.lit(None))
+        .alias("avg_entry_price"),
+    )
+
+    # Derive last trade prices for resolution
+    token1_trades = trades_df.filter(pl.col("nonusdc_side") == "token1")
+    if len(token1_trades) > 0:
+        final_last_prices = (
+            token1_trades
+            .sort("timestamp")
+            .unique(subset=["market_id"], keep="last")
+            .select(
+                pl.col("market_id"),
+                pl.col("price").alias("last_price"),
+                pl.col("timestamp").alias("last_trade_ts"),
+            )
+        )
+    else:
+        final_last_prices = pl.DataFrame(schema={
+            "market_id": pl.Int64, "last_price": pl.Float64,
+            "last_trade_ts": pl.Datetime("us"),
+        })
+
+    # Derive resolution and join market info
+    markets_resolved = derive_resolution(markets_df, final_last_prices)
+    market_info = markets_resolved.select(
+        pl.col("id").cast(pl.Int64).alias("market_id"),
+        pl.col("volume").alias("market_volume"),
+        pl.col("closedTime").alias("closed_time"),
+        pl.col("resolution"),
+        pl.col("question").alias("market_question"),
+    )
+
+    positions_final = positions.join(market_info, on="market_id", how="left")
+
+    positions_final = positions_final.with_columns(
+        pl.when(pl.col("resolution").is_in(["token1", "token2"]) & (pl.col("resolution") == pl.col("side")))
+        .then(pl.lit(True))
+        .otherwise(pl.lit(False))
+        .alias("position_won"),
+    )
+
+    return positions_final
+
+
 def main():
     print("=" * 60)
-    print("Building wallet positions from trades.csv")
+    print("Building wallet positions from trades")
     print("=" * 60)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    trades_path = TRADES_PATH.resolve()
+    trades_dir = TRADES_DIR.resolve()
+    activity_dir = ACTIVITY_DIR.resolve()
     markets_path = MARKETS_PATH.resolve()
 
-    print(f"Trades file: {trades_path}")
+    print(f"Trades dir:   {trades_dir}")
+    print(f"Activity dir: {activity_dir}")
     print(f"Markets file: {markets_path}")
 
-    if not trades_path.exists():
-        raise FileNotFoundError(f"Trades file not found: {trades_path}")
+    if not trades_dir.exists():
+        raise FileNotFoundError(f"Trades directory not found: {trades_dir}")
     if not markets_path.exists():
         raise FileNotFoundError(f"Markets file not found: {markets_path}")
 
-    # ---- Phase 1: Process trades in batches ----
-    print(f"\nPhase 1: Reading trades in batches of {BATCH_SIZE:,} rows...")
-    start = time.time()
+    part_files = sorted(trades_dir.glob("*.parquet"))
+    if activity_dir.exists():
+        activity_files = sorted(activity_dir.glob("*.parquet"))
+        print(f"  Activity files: {len(activity_files)}")
+        part_files += activity_files
+    if not part_files:
+        raise FileNotFoundError(f"No Parquet files found in {trades_dir}")
 
-    reader = pl.read_csv_batched(
-        trades_path,
-        schema_overrides={
-            "timestamp": pl.Utf8,
-            "market_id": pl.Utf8,
-            "maker": pl.Utf8,
-            "taker": pl.Utf8,
-            "nonusdc_side": pl.Utf8,
-            "maker_direction": pl.Utf8,
-            "taker_direction": pl.Utf8,
-            "price": pl.Float64,
-            "usd_amount": pl.Float64,
-            "token_amount": pl.Float64,
-            "transactionHash": pl.Utf8,
-        },
-        batch_size=BATCH_SIZE,
-    )
+    # ---- Phase 1: Process trades in batches ----
+    print(f"\nPhase 1: Reading {len(part_files)} Parquet part-files...")
+    start = time.time()
 
     partial_aggs = []
     # Also collect last trade price per (market_id, side=token1) for resolution derivation
@@ -201,14 +266,11 @@ def main():
     total_rows = 0
     batch_num = 0
 
-    while True:
-        batches = reader.next_batches(1)
-        if batches is None or len(batches) == 0:
-            break
-        batch = batches[0]
+    for part_file in part_files:
+        batch = pl.read_parquet(part_file)
         batch_num += 1
         total_rows += len(batch)
-        print(f"  Batch {batch_num}: {total_rows:,} rows processed", flush=True)
+        print(f"  [{batch_num}/{len(part_files)}] {total_rows:,} rows processed", flush=True)
 
         # Get partial aggregation for this batch
         agg = process_batch(batch)
@@ -312,7 +374,7 @@ def main():
 
     # Select relevant market columns for join
     market_info = markets_resolved.select(
-        pl.col("id").alias("market_id"),
+        pl.col("id").cast(pl.Int64).alias("market_id"),
         pl.col("volume").alias("market_volume"),
         pl.col("closedTime").alias("closed_time"),
         pl.col("resolution"),

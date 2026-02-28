@@ -4,10 +4,14 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-from lib.data import timing_overview, top_timing_wallets, spike_magnitude_distribution
+from lib.data import timing_overview, top_timing_wallets, spike_magnitude_distribution, signal2_available
 
 st.title("Timing Anomalies (Signal 2)")
 st.caption("Wallets that consistently trade before large price moves")
+
+if not signal2_available():
+    st.info("Signal 2 data not available. Run the signal 2 analysis to populate this page.")
+    st.stop()
 
 # --- Overview metrics ---
 stats = timing_overview()

@@ -7,10 +7,10 @@
 Run all signal2 (timing) analysis scripts.
 
 Order (sequential — each step depends on the previous):
-  1. build_price_history   (reads trades.csv)
+  1. build_price_history   (reads trades/)
   2. detect_price_spikes   (reads price_history.parquet)
-  3. pre_spike_wallets     (reads price_spikes.parquet + trades.csv)
-  4. timing_score          (reads pre_spike_trades.parquet + trades.csv)
+  3. pre_spike_wallets     (reads price_spikes.parquet + trades/)
+  4. timing_score          (reads pre_spike_trades.parquet + trades/)
 
 Memory safety:
   - Warns at 85%, kills at 93%.

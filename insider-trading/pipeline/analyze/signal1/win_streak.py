@@ -57,6 +57,88 @@ def compute_current_streak(wins: list[bool]) -> int:
     return streak
 
 
+def compute_win_streak(positions: pl.DataFrame) -> pl.DataFrame:
+    """Compute win streak metrics from a positions DataFrame.
+
+    Accepts wallet_positions-format DataFrame (can be pre-filtered).
+    Returns per-wallet win streak stats with raw values.
+    """
+    resolved = positions.filter(
+        pl.col("resolution").is_in(["token1", "token2"])
+    )
+
+    if len(resolved) == 0:
+        return pl.DataFrame({"wallet": []}, schema={"wallet": pl.String})
+
+    resolved = resolved.with_columns(
+        pl.col("position_won").fill_null(False),
+    )
+
+    ts_dtype = resolved.schema["first_trade_timestamp"]
+    if ts_dtype == pl.Utf8 or ts_dtype == pl.String:
+        resolved = resolved.with_columns(
+            pl.col("first_trade_timestamp").str.to_datetime(strict=False),
+        )
+    elif ts_dtype not in (pl.Datetime, pl.Date):
+        resolved = resolved.with_columns(
+            pl.col("first_trade_timestamp").cast(pl.Datetime, strict=False),
+        )
+
+    resolved_sorted = resolved.sort(["wallet", "first_trade_timestamp"])
+
+    wallet_sequences = (
+        resolved_sorted
+        .group_by("wallet")
+        .agg(
+            pl.col("position_won").sort_by("first_trade_timestamp").alias("win_sequence"),
+            pl.col("total_usd_in").sum().alias("total_volume"),
+            pl.col("position_won").sum().alias("total_wins"),
+            pl.col("position_won").count().alias("resolved_bet_count"),
+        )
+    )
+
+    wallet_stats = wallet_sequences.with_columns(
+        pl.col("win_sequence")
+        .map_elements(compute_longest_streak, return_dtype=pl.Int64)
+        .alias("longest_win_streak"),
+        pl.col("win_sequence")
+        .map_elements(compute_current_streak, return_dtype=pl.Int64)
+        .alias("current_streak"),
+        (pl.col("total_wins") / pl.col("resolved_bet_count")).alias("win_rate"),
+    )
+
+    wallet_stats = wallet_stats.with_columns(
+        pl.when((pl.col("win_rate") > 0) & (pl.col("win_rate") < 1.0))
+        .then(
+            pl.col("longest_win_streak")
+            / (
+                pl.col("resolved_bet_count").cast(pl.Float64).log()
+                / (1.0 / pl.col("win_rate")).log()
+            )
+        )
+        .otherwise(
+            pl.when(pl.col("win_rate") == 1.0)
+            .then(pl.lit(1.0))
+            .otherwise(pl.lit(0.0))
+        )
+        .alias("streak_vs_expected_ratio"),
+    )
+
+    output = wallet_stats.drop("win_sequence")
+
+    output = output.with_columns(
+        (
+            (pl.col("longest_win_streak") >= FLAG_STREAK_LENGTH)
+            & (pl.col("resolved_bet_count") >= MIN_RESOLVED_BETS)
+        ).alias("flagged"),
+    )
+
+    return output.sort(
+        ["flagged", "longest_win_streak", "resolved_bet_count"],
+        descending=[True, True, True],
+    )
+
+
 def main():
     print("=" * 60)
     print("Metric 7: Win Streak")
@@ -70,109 +152,10 @@ def main():
             "Run build_positions.py first."
         )
 
-    # Load wallet positions
     print("Loading wallet positions...")
     positions = pl.read_parquet(INPUT_PATH)
 
-    # Filter to resolved markets only
-    resolved = positions.filter(
-        pl.col("resolution").is_in(["token1", "token2"])
-    )
-    print(f"  Resolved positions: {len(resolved):,}")
-
-    if len(resolved) == 0:
-        print("No resolved positions found. Writing empty output.")
-        pl.DataFrame({"wallet": []}).write_parquet(str(OUTPUT_PATH))
-        print("Done!")
-        return
-
-    # Fill position_won nulls before streak computation
-    resolved = resolved.with_columns(
-        pl.col("position_won").fill_null(False),
-    )
-
-    # Ensure first_trade_timestamp is datetime for correct chronological ordering.
-    # If stored as string (e.g., epoch-style or ISO strings), lexicographic sort
-    # gives wrong order. Cast to Datetime if not already.
-    ts_dtype = resolved.schema["first_trade_timestamp"]
-    if ts_dtype == pl.Utf8 or ts_dtype == pl.String:
-        resolved = resolved.with_columns(
-            pl.col("first_trade_timestamp").str.to_datetime(strict=False),
-        )
-    elif ts_dtype not in (pl.Datetime, pl.Date):
-        # Attempt a general cast for other numeric types (e.g., Int64 epoch)
-        resolved = resolved.with_columns(
-            pl.col("first_trade_timestamp").cast(pl.Datetime, strict=False),
-        )
-
-    # Sort by wallet and first_trade_timestamp to get chronological order
-    resolved_sorted = resolved.sort(["wallet", "first_trade_timestamp"])
-
-    # Group by wallet and collect ordered list of win/loss outcomes.
-    # Use sort_by inside agg to guarantee chronological order within each group,
-    # since group_by does NOT preserve sort order in Polars.
-    wallet_sequences = (
-        resolved_sorted
-        .group_by("wallet")
-        .agg(
-            pl.col("position_won").sort_by("first_trade_timestamp").alias("win_sequence"),
-            pl.col("market_id").sort_by("first_trade_timestamp").alias("market_sequence"),
-            pl.col("first_trade_timestamp").sort_by("first_trade_timestamp").alias("timestamp_sequence"),
-            pl.col("total_usd_in").sum().alias("total_volume"),
-            pl.col("position_won").sum().alias("total_wins"),
-            pl.col("position_won").count().alias("resolved_bet_count"),
-        )
-    )
-
-    # Compute streaks using map_elements on the list column
-    wallet_stats = wallet_sequences.with_columns(
-        pl.col("win_sequence")
-        .map_elements(compute_longest_streak, return_dtype=pl.Int64)
-        .alias("longest_win_streak"),
-        pl.col("win_sequence")
-        .map_elements(compute_current_streak, return_dtype=pl.Int64)
-        .alias("current_streak"),
-        (pl.col("total_wins") / pl.col("resolved_bet_count")).alias("win_rate"),
-    )
-
-    # Compute expected longest streak using actual win rate.
-    # For n independent trials with win probability p, the expected longest run
-    # of successes is approximately log(n) / log(1/p).
-    # We report actual / expected ratio.
-    wallet_stats = wallet_stats.with_columns(
-        pl.when((pl.col("win_rate") > 0) & (pl.col("win_rate") < 1.0))
-        .then(
-            pl.col("longest_win_streak")
-            / (
-                pl.col("resolved_bet_count").cast(pl.Float64).log()
-                / (1.0 / pl.col("win_rate")).log()
-            )
-        )
-        .otherwise(
-            # If win_rate is 0 or 1, the formula degenerates; use simple ratio
-            pl.when(pl.col("win_rate") == 1.0)
-            .then(pl.lit(1.0))  # Perfect record: streak == n, expected == n
-            .otherwise(pl.lit(0.0))  # No wins: streak is 0
-        )
-        .alias("streak_vs_expected_ratio"),
-    )
-
-    # Drop list columns for output
-    output = wallet_stats.drop(["win_sequence", "market_sequence", "timestamp_sequence"])
-
-    # Add flag: streak > 7 (i.e., >= 8)
-    output = output.with_columns(
-        (
-            (pl.col("longest_win_streak") >= FLAG_STREAK_LENGTH)
-            & (pl.col("resolved_bet_count") >= MIN_RESOLVED_BETS)
-        ).alias("flagged"),
-    )
-
-    # Sort: flagged first, then by streak length
-    output = output.sort(
-        ["flagged", "longest_win_streak", "resolved_bet_count"],
-        descending=[True, True, True],
-    )
+    output = compute_win_streak(positions)
 
     # Write output
     print(f"\nWriting {len(output):,} wallet records to {OUTPUT_PATH}")

@@ -5,13 +5,14 @@ Each run writes to a dated directory on the volume: /vol/runs/YYYY-MM-DD/
 so existing data at /vol/ is never overwritten.
 
 Usage:
-    python3 run.py scrape          # historical + markets + gap (5 containers x 20 workers)
+    python3 run.py scrape          # historical + markets + gap + activity
     python3 run.py scrape-gap      # gap scrape only
     python3 run.py scrape-hist     # historical download only
     python3 run.py scrape-markets  # market metadata only
+    python3 run.py scrape-activity # splits/merges/redemptions only
     python3 run.py scan            # quick volume scan
     python3 run.py scan-full       # full volume scan (row counts)
-    python3 run.py ingest          # consolidate + trades
+    python3 run.py ingest          # process trades + activity from scrape data
     python3 run.py analyze         # signal 1 + signal 2
     python3 run.py analyze-s1      # signal 1 only
     python3 run.py analyze-s2      # signal 2 only
@@ -22,19 +23,20 @@ import subprocess
 import sys
 from datetime import date
 
-BASE_DIR = f"/vol/runs/{date.today().isoformat()}"
+BASE_DIR = f"/vol/runs/{date.today().isoformat()}-take-2"
 
 STAGES = {
-    "scrape":         [sys.executable, "-m", "modal", "run", "modal_app/scrape.py", "--task", "all", "--output-dir", BASE_DIR],
-    "scrape-gap":     [sys.executable, "-m", "modal", "run", "modal_app/scrape.py", "--task", "gap", "--output-dir", BASE_DIR],
-    "scrape-hist":    [sys.executable, "-m", "modal", "run", "modal_app/scrape.py", "--task", "historical", "--output-dir", BASE_DIR],
-    "scrape-markets": [sys.executable, "-m", "modal", "run", "modal_app/scrape.py", "--task", "markets", "--output-dir", BASE_DIR],
-    "scan":           [sys.executable, "-m", "modal", "run", "modal_app/scan.py"],
-    "scan-full":      [sys.executable, "-m", "modal", "run", "modal_app/scan.py", "--full"],
-    "ingest":         [sys.executable, "-m", "modal", "run", "modal_app/ingest.py", "--output-dir", BASE_DIR],
-    "analyze":        [sys.executable, "-m", "modal", "run", "modal_app/analyze.py", "--output-dir", BASE_DIR],
-    "analyze-s1":     [sys.executable, "-m", "modal", "run", "modal_app/analyze.py", "--signal", "1", "--output-dir", BASE_DIR],
-    "analyze-s2":     [sys.executable, "-m", "modal", "run", "modal_app/analyze.py", "--signal", "2", "--output-dir", BASE_DIR],
+    "scrape":          [sys.executable, "-m", "modal", "run", "modal_app/scrape.py", "--task", "all", "--output-dir", BASE_DIR],
+    "scrape-gap":      [sys.executable, "-m", "modal", "run", "modal_app/scrape.py", "--task", "gap", "--output-dir", BASE_DIR],
+    "scrape-hist":     [sys.executable, "-m", "modal", "run", "modal_app/scrape.py", "--task", "historical", "--output-dir", BASE_DIR],
+    "scrape-markets":  [sys.executable, "-m", "modal", "run", "modal_app/scrape.py", "--task", "markets", "--output-dir", BASE_DIR],
+    "scrape-activity": [sys.executable, "-m", "modal", "run", "modal_app/scrape.py", "--task", "activity", "--output-dir", BASE_DIR],
+    "scan":            [sys.executable, "-m", "modal", "run", "modal_app/scan.py"],
+    "scan-full":       [sys.executable, "-m", "modal", "run", "modal_app/scan.py", "--full"],
+    "ingest":          [sys.executable, "-m", "modal", "run", "modal_app/ingest.py", "--output-dir", BASE_DIR],
+    "analyze":         [sys.executable, "-m", "modal", "run", "modal_app/analyze.py", "--output-dir", BASE_DIR],
+    "analyze-s1":      [sys.executable, "-m", "modal", "run", "modal_app/analyze.py", "--signal", "1", "--output-dir", BASE_DIR],
+    "analyze-s2":      [sys.executable, "-m", "modal", "run", "modal_app/analyze.py", "--signal", "2", "--output-dir", BASE_DIR],
 }
 
 PIPELINES = {

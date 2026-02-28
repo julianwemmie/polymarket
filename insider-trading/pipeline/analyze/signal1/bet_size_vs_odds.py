@@ -42,53 +42,32 @@ MIN_EXTREME_BETS = 3
 FLAG_EXTREME_WIN_RATE = 0.60
 
 
-def main():
-    print("=" * 60)
-    print("Metric 9: Bet Size vs Odds")
-    print("=" * 60)
+def compute_bet_size_vs_odds(positions: pl.DataFrame) -> pl.DataFrame:
+    """Compute bet size vs odds metrics from a positions DataFrame.
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(
-            f"wallet_positions.parquet not found at {INPUT_PATH}. "
-            "Run build_positions.py first."
-        )
-
-    # Load wallet positions
-    print("Loading wallet positions...", flush=True)
-    positions = pl.read_parquet(INPUT_PATH)
-    print(f"  Loaded {len(positions):,} positions", flush=True)
-
-    # Filter to resolved markets
-    print("  Filtering to resolved markets...", flush=True)
+    Accepts wallet_positions-format DataFrame (can be pre-filtered).
+    Returns per-wallet bet size vs odds stats with raw values.
+    """
     resolved = positions.filter(
         pl.col("resolution").is_in(["token1", "token2"])
     )
-    print(f"  Resolved positions: {len(resolved):,}", flush=True)
 
-    # Ensure position_won has no nulls
+    if len(resolved) == 0:
+        return pl.DataFrame({"wallet": []}, schema={"wallet": pl.String})
+
     resolved = resolved.with_columns(
         pl.col("position_won").fill_null(False),
     )
 
-    # Add odds classification and payout calculations
-    print("  Classifying odds and computing payouts...", flush=True)
     resolved_with_odds = resolved.with_columns(
-        # Potential payout in absolute USD: net_tokens * (1 - avg_entry_price)
-        # This is the profit on the remaining position if the tokens win
-        # (each token redeems at $1, so profit per token = 1 - cost_basis).
-        # Guard against null avg_entry_price (sell-only positions).
         pl.when(pl.col("avg_entry_price").is_not_null() & (pl.col("avg_entry_price") > 0))
         .then(pl.col("net_tokens") * (1.0 - pl.col("avg_entry_price")))
         .otherwise(pl.lit(0.0))
         .alias("potential_payout_usd"),
-        # Payout ratio per $1 (kept for reference)
         pl.when(pl.col("avg_entry_price") > 0)
         .then((1.0 / pl.col("avg_entry_price")) - 1.0)
         .otherwise(pl.lit(0.0))
         .alias("payout_ratio"),
-        # Classify odds range
         pl.when(pl.col("avg_entry_price") < EXTREME_LOW_ODDS)
         .then(pl.lit("extreme_longshot"))
         .when(pl.col("avg_entry_price") > EXTREME_HIGH_ODDS)
@@ -99,21 +78,16 @@ def main():
         .then(pl.lit("favorite"))
         .otherwise(pl.lit("mid_range"))
         .alias("odds_category"),
-        # Is this an extreme odds bet?
         (
             (pl.col("avg_entry_price") < EXTREME_LOW_ODDS)
             | (pl.col("avg_entry_price") > EXTREME_HIGH_ODDS)
         ).alias("is_extreme_odds"),
-        # Is this a large bet?
         (pl.col("total_usd_in") >= LARGE_BET_THRESHOLD).alias("is_large_bet"),
     )
 
-    # ---- Per-wallet: extreme longshot behavior (< 10%) ----
-    print("  Analyzing extreme longshots...", flush=True)
     extreme_longshots = resolved_with_odds.filter(
         pl.col("avg_entry_price") < EXTREME_LOW_ODDS
     )
-
     longshot_stats = extreme_longshots.group_by("wallet").agg(
         pl.col("market_id").count().alias("longshot_bet_count"),
         pl.col("position_won").sum().alias("longshot_wins"),
@@ -125,12 +99,9 @@ def main():
         (pl.col("longshot_wins") / pl.col("longshot_bet_count")).alias("longshot_win_rate"),
     )
 
-    # ---- Per-wallet: extreme high-odds behavior (> 90%) ----
-    print("  Analyzing extreme favorites...", flush=True)
     extreme_favorites = resolved_with_odds.filter(
         pl.col("avg_entry_price") > EXTREME_HIGH_ODDS
     )
-
     favorite_stats = extreme_favorites.group_by("wallet").agg(
         pl.col("market_id").count().alias("favorite_bet_count"),
         pl.col("position_won").sum().alias("favorite_wins"),
@@ -139,17 +110,13 @@ def main():
         pl.col("avg_entry_price").mean().alias("favorite_mean_entry"),
         pl.col("potential_payout_usd").mean().alias("favorite_mean_potential_payout"),
     ).with_columns(
-        # For favorites, we care about LOSS rate (insiders know the favorite will fail)
         (pl.col("favorite_wins") / pl.col("favorite_bet_count")).alias("favorite_win_rate"),
         (1.0 - pl.col("favorite_wins") / pl.col("favorite_bet_count")).alias("favorite_loss_rate"),
     )
 
-    # ---- Large bets at extreme odds (the most suspicious pattern) ----
-    print("  Analyzing large bets at extreme odds...", flush=True)
     large_extreme = resolved_with_odds.filter(
         pl.col("is_extreme_odds") & pl.col("is_large_bet")
     )
-
     large_extreme_stats = large_extreme.group_by("wallet").agg(
         pl.col("market_id").count().alias("large_extreme_count"),
         pl.col("position_won").sum().alias("large_extreme_wins"),
@@ -162,14 +129,11 @@ def main():
         .alias("large_extreme_win_rate"),
     )
 
-    # ---- Overall wallet stats for context ----
-    print("  Computing overall wallet stats...", flush=True)
     overall = resolved_with_odds.group_by("wallet").agg(
         pl.col("market_id").count().alias("total_bet_count"),
         pl.col("total_usd_in").sum().alias("total_volume"),
         pl.col("total_usd_in").mean().alias("avg_bet_size"),
         pl.col("position_won").sum().alias("total_wins"),
-        # Average bet size at different odds ranges for Kelly analysis
         pl.col("total_usd_in")
         .filter(pl.col("odds_category") == "mid_range")
         .mean()
@@ -182,8 +146,6 @@ def main():
         (pl.col("total_wins") / pl.col("total_bet_count")).alias("overall_win_rate"),
     )
 
-    # Compute "inverse Kelly" ratio: if extreme bet size > mid-range bet size,
-    # the wallet is doing the opposite of rational bankroll management
     overall = overall.with_columns(
         pl.when(
             pl.col("avg_bet_size_mid_range").is_not_null()
@@ -195,13 +157,10 @@ def main():
         .alias("extreme_to_midrange_size_ratio"),
     )
 
-    # Join all stats together
-    print("  Joining all stats...", flush=True)
     wallet_stats = overall.join(longshot_stats, on="wallet", how="left")
     wallet_stats = wallet_stats.join(favorite_stats, on="wallet", how="left")
     wallet_stats = wallet_stats.join(large_extreme_stats, on="wallet", how="left")
 
-    # Fill nulls for wallets with no extreme/longshot/favorite bets
     wallet_stats = wallet_stats.with_columns(
         pl.col("longshot_bet_count").fill_null(0),
         pl.col("longshot_wins").fill_null(0),
@@ -215,32 +174,21 @@ def main():
         pl.col("large_extreme_win_rate").fill_null(0.0),
     )
 
-    # Add flags
-    #
-    # NOTE: flagged_favorite_loser was removed because it catches wallets that
-    # bet on >90% favorites and lose frequently -- i.e., bad bettors, not insiders.
-    # An insider who knows a favorite will fail would SHORT the favorite (buy the
-    # underdog at <10%), which is already captured by the longshot analysis.
-    # The extreme_favorites stats are kept for informational purposes.
     wallet_stats = wallet_stats.with_columns(
-        # Primary flag: large bets at extreme odds with high win rate
         (
             (pl.col("large_extreme_count") >= MIN_EXTREME_BETS)
             & (pl.col("large_extreme_win_rate") > FLAG_EXTREME_WIN_RATE)
         ).alias("flagged_large_extreme"),
-        # Secondary flag: high longshot win rate
         (
             (pl.col("longshot_bet_count") >= MIN_EXTREME_BETS)
             & (pl.col("longshot_win_rate") > FLAG_EXTREME_WIN_RATE)
         ).alias("flagged_longshot_winner"),
-        # Tertiary flag: inverse Kelly behavior (bets bigger at extreme odds)
         (
             pl.col("extreme_to_midrange_size_ratio").is_not_null()
             & (pl.col("extreme_to_midrange_size_ratio") > 2.0)
         ).alias("flagged_inverse_kelly"),
     )
 
-    # Combined flag: any of the above
     wallet_stats = wallet_stats.with_columns(
         (
             pl.col("flagged_large_extreme")
@@ -249,12 +197,31 @@ def main():
         ).alias("flagged"),
     )
 
-    # Sort with nulls_last to handle nullable columns gracefully
-    wallet_stats = wallet_stats.sort(
+    return wallet_stats.sort(
         ["flagged_large_extreme", "flagged", "large_extreme_usd"],
         descending=[True, True, True],
         nulls_last=True,
     )
+
+
+def main():
+    print("=" * 60)
+    print("Metric 9: Bet Size vs Odds")
+    print("=" * 60)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not INPUT_PATH.exists():
+        raise FileNotFoundError(
+            f"wallet_positions.parquet not found at {INPUT_PATH}. "
+            "Run build_positions.py first."
+        )
+
+    print("Loading wallet positions...", flush=True)
+    positions = pl.read_parquet(INPUT_PATH)
+    print(f"  Loaded {len(positions):,} positions", flush=True)
+
+    wallet_stats = compute_bet_size_vs_odds(positions)
 
     # Write output
     print(f"\nWriting {len(wallet_stats):,} wallet records to {OUTPUT_PATH}")

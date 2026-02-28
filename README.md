@@ -7,17 +7,18 @@ Detecting insider trading on [Polymarket](https://polymarket.com) by analyzing 6
 ```
 insider-trading/
 ├── pipeline/               # pure logic, no Modal imports
-│   ├── scrape/             #   data acquisition (historical, gap, markets)
-│   ├── ingest/             #   consolidate events + compute trades
+│   ├── scrape/             #   data acquisition (historical, gap, markets, activity)
+│   ├── ingest/             #   process raw scrape data into trades + activity
 │   ├── analyze/
 │   │   ├── signal1/        #   statistical implausibility scoring
 │   │   └── signal2/        #   timing anomaly detection
 │   └── utils/              #   shared helpers
 ├── modal_app/              # thin Modal wrappers (import from pipeline/)
+├── run.py                  # CLI runner for full pipeline on Modal
 ├── dashboard/              # Streamlit visualization
 ├── data/                   # shared artifacts (gitignored)
-│   ├── scrape/             #   historical.csv, chunks, markets.csv
-│   ├── ingest/             #   orderFilled.csv, trades.csv
+│   ├── scrape/             #   historical.csv, chunks, markets.csv, splits/merges/redemptions
+│   ├── ingest/             #   trades/ + activity/ (partitioned parquet)
 │   └── analyze/            #   parquet outputs
 │       ├── signal1/
 │       └── signal2/
@@ -33,8 +34,8 @@ insider-trading/
 Each pipeline stage appends its own prefix (`/scrape`, `/ingest`, `/analyze/signal{1,2}`), so a base of `/vol` produces:
 
 ```
-/vol/scrape/          ← historical.csv, chunk_*.csv.gz, markets.csv
-/vol/ingest/          ← orderFilled.csv, trades.csv
+/vol/scrape/          ← historical.csv, chunk_*.csv.gz, markets.csv, splits/merges/redemptions.csv.gz
+/vol/ingest/          ← trades/ + activity/ (partitioned parquet)
 /vol/analyze/signal1/ ← parquet outputs
 /vol/analyze/signal2/ ← parquet outputs
 ```
@@ -51,11 +52,13 @@ All data acquisition lives in `pipeline/scrape/`:
 
 **Market metadata** (questions, tokens, outcomes) is fetched from Polymarket's Gamma API by `pipeline/scrape/markets.py`.
 
-### 2. Ingest: consolidate and process
+**Activity events** (splits, merges, redemptions) are scraped from Polymarket's activity-subgraph by `pipeline/scrape/activity.py`. These capture wallets that enter/exit positions via the SPLIT/MERGE/REDEEM contract operations rather than the orderbook.
 
-`pipeline/ingest/consolidate.py` merges the historical CSV and scraper chunks into a single `orderFilled.csv`.
+### 2. Ingest: process trades
 
-`pipeline/ingest/trades.py` joins raw order fills with market metadata to produce structured trades with market IDs, prices, buy/sell directions, and USD amounts.
+`pipeline/ingest/trades.py` reads directly from scrape sources (`historical.csv` + `chunk_*.csv.gz`), joins with market metadata, and produces structured trades with market IDs, prices, buy/sell directions, and USD amounts. The historical file is streamed in batches to keep memory bounded; chunk files are read individually.
+
+`pipeline/ingest/activity.py` converts scraped activity events (splits/merges/redemptions) into synthetic trade rows matching the same schema. Splits and merges each produce two rows (one per token side) at price 0.50; redemptions produce one row at price 1.00. This gives wallets that use SPLIT/MERGE a proper cost basis in the pipeline.
 
 ### 3. Analyze trades
 
@@ -79,6 +82,29 @@ The entire pipeline runs on [Modal](https://modal.com) with data stored on a sha
 
 All `modal run` commands are run from `insider-trading/`.
 
+### Quick start with `run.py`
+
+`run.py` wraps the full pipeline with dated output directories (`/vol/runs/YYYY-MM-DD/`):
+
+```bash
+cd insider-trading
+
+python3 run.py all              # full pipeline: scrape → ingest → analyze
+
+# Or run individual stages:
+python3 run.py scrape           # historical + markets + gap + activity
+python3 run.py scrape-gap       # gap scrape only
+python3 run.py scrape-hist      # historical download only
+python3 run.py scrape-markets   # market metadata only
+python3 run.py scrape-activity  # splits/merges/redemptions only
+python3 run.py scan             # quick volume scan
+python3 run.py scan-full        # full scan (row counts)
+python3 run.py ingest           # process trades + activity from scrape data
+python3 run.py analyze          # signal 1 + signal 2
+python3 run.py analyze-s1       # signal 1 only
+python3 run.py analyze-s2       # signal 2 only
+```
+
 ### Setup
 
 ```bash
@@ -89,12 +115,13 @@ python3 -m modal setup  # authenticate via browser
 ### Step 1: Scrape
 
 ```bash
-# Run everything: historical download + markets + gap scrape
+# Run everything: historical download + markets + gap scrape + activity
 modal run modal_app/scrape.py --task all
 
 # Or run individual tasks:
 modal run modal_app/scrape.py --task historical       # download bulk archive from S3
 modal run modal_app/scrape.py --task markets           # fetch market metadata
+modal run modal_app/scrape.py --task activity          # scrape splits/merges/redemptions
 modal run modal_app/scrape.py                          # gap scrape (default)
 
 # Gap scrape options:
@@ -118,7 +145,7 @@ modal run modal_app/scan.py --full
 ### Step 3: Ingest
 
 ```bash
-# Consolidate raw events + process trades (reads from /scrape/, writes to /ingest/)
+# Process trades (reads from /scrape/, writes to /ingest/)
 modal run modal_app/ingest.py
 ```
 
@@ -154,10 +181,11 @@ cd insider-trading
 uv run python -m pipeline.scrape.historical        # download bulk data
 uv run python -m pipeline.scrape.markets            # fetch market metadata
 uv run python pipeline/scrape/scraper.py            # gap scrape (20 async workers)
+uv run python -m pipeline.scrape.activity           # scrape splits/merges/redemptions
 
 # Ingest
-uv run python -m pipeline.ingest.consolidate        # merge historical + chunks
-uv run python -m pipeline.ingest.trades             # process trades
+uv run python -m pipeline.ingest.trades             # process trades from scrape sources
+uv run python -m pipeline.ingest.activity           # process activity events
 
 # Analyze
 uv run python pipeline/analyze/signal1/run_all.py
